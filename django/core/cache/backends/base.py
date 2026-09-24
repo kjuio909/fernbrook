@@ -1,5 +1,6 @@
 "Base Cache class."
 
+import asyncio
 import time
 import warnings
 
@@ -83,6 +84,10 @@ class BaseCache:
         self.key_prefix = params.get("KEY_PREFIX", "")
         self.version = params.get("VERSION", 1)
         self.key_func = get_key_func(params.get("KEY_FUNCTION"))
+
+        # In-flight aget_or_set() generations, keyed by made cache key, so
+        # that concurrent misses on the same key share a single computation.
+        self._aget_or_set_in_flight = {}
 
     def get_backend_timeout(self, timeout=DEFAULT_TIMEOUT):
         """
@@ -245,14 +250,49 @@ class BaseCache:
                 key, default, timeout=timeout, version=version
             )
         val = await self.aget(key, self._missing_key, version=version)
-        if val is self._missing_key:
-            if callable(default):
-                default = default()
-            await self.aadd(key, default, timeout=timeout, version=version)
-            # Fetch the value again to avoid a race condition if another caller
-            # added a value between the first aget() and the aadd() above.
-            return await self.aget(key, default, version=version)
-        return val
+        if val is not self._missing_key:
+            return val
+        # The key is missing. Deduplicate concurrent generation of the
+        # default for this key so that only one caller computes it while
+        # the others await and share its outcome. Keys (including the
+        # version) are independent of each other.
+        dedup_key = self.make_key(key, version=version)
+        in_flight = self._aget_or_set_in_flight
+        future = in_flight.get(dedup_key)
+        if future is not None:
+            # Another caller is already generating the value for this key;
+            # wait for the same outcome instead of computing a second one.
+            # Shield the future so cancellation of this waiter doesn't
+            # cancel the shared generation.
+            succeeded, result = await asyncio.shield(future)
+            if succeeded:
+                return result
+            raise result
+        future = asyncio.get_running_loop().create_future()
+        in_flight[dedup_key] = future
+        try:
+            # Check the cache again in case the value appeared while the
+            # future was being registered.
+            val = await self.aget(key, self._missing_key, version=version)
+            if val is self._missing_key:
+                if callable(default):
+                    default = default()
+                await self.aadd(key, default, timeout=timeout, version=version)
+                # Fetch the value again to avoid a race condition if
+                # another caller added a value between the first aget()
+                # and the aadd() above.
+                val = await self.aget(key, default, version=version)
+        except BaseException as exc:
+            # Share the failure with any waiters; removing the in-flight
+            # entry below lets later calls retry the computation.
+            future.set_result((False, exc))
+            raise
+        else:
+            future.set_result((True, val))
+            return val
+        finally:
+            if in_flight.get(dedup_key) is future:
+                del in_flight[dedup_key]
 
     def has_key(self, key, version=None):
         """

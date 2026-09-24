@@ -1,5 +1,6 @@
 # Unit tests for cache framework
 # Uses whatever cache backend is set in the test settings file.
+import asyncio
 import copy
 import io
 import os
@@ -25,7 +26,11 @@ from django.core.cache import (
     cache,
     caches,
 )
-from django.core.cache.backends.base import BaseCache, InvalidCacheBackendError
+from django.core.cache.backends.base import (
+    DEFAULT_TIMEOUT,
+    BaseCache,
+    InvalidCacheBackendError,
+)
 from django.core.cache.backends.redis import RedisCacheClient
 from django.core.cache.utils import make_template_fragment_key
 from django.db import close_old_connections, connection, connections
@@ -1167,6 +1172,51 @@ class BaseCacheTests:
             cache_add.return_value = False
             self.assertEqual(cache.get_or_set("key", "default"), "default")
 
+    async def test_aget_or_set_concurrent_calls_share_result(self):
+        """
+        Concurrent aget_or_set() calls for the same missing key compute the
+        default once and share the resulting value.
+        """
+        calls = 0
+
+        def default():
+            nonlocal calls
+            calls += 1
+            return "value"
+
+        results = await asyncio.gather(
+            *(cache.aget_or_set("shared_key", default) for _ in range(5))
+        )
+        self.assertEqual(results, ["value"] * 5)
+        self.assertEqual(calls, 1)
+        self.assertEqual(await cache.aget("shared_key"), "value")
+
+    async def test_aget_or_set_concurrent_calls_share_failure(self):
+        """
+        If computing the default fails, concurrent aget_or_set() calls for
+        the same key all fail, nothing is cached, and a later call retries.
+        """
+        calls = 0
+
+        def failing_default():
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("generation failed")
+
+        results = await asyncio.gather(
+            *(cache.aget_or_set("failing_key", failing_default) for _ in range(3)),
+            return_exceptions=True,
+        )
+        self.assertEqual(len(results), 3)
+        for result in results:
+            self.assertIsInstance(result, RuntimeError)
+        self.assertEqual(calls, 1)
+        self.assertIsNone(await cache.aget("failing_key"))
+        # The failure isn't latched: a later call computes the default again.
+        self.assertEqual(
+            await cache.aget_or_set("failing_key", "recovered"), "recovered"
+        )
+
     async def test_get_many_async_uses_specialized_implementation(self):
         if (
             cache.get_many.__func__ is not BaseCache.get_many
@@ -1250,6 +1300,155 @@ class BaseCacheTests:
                 mocked.__func__ = lambda x: x
                 await cache.aclose()
                 mocked.assert_called_once()
+
+
+class AGetOrSetStubCache(BaseCache):
+    """
+    Minimal in-memory async cache with hooks to control the timing and
+    outcome of aadd(), used to exercise aget_or_set() concurrency.
+    """
+
+    def __init__(self, params):
+        super().__init__(params)
+        self._cache = {}
+        self.add_calls = 0
+        # When set to a made key, aadd() for that key signals add_started
+        # and waits for add_continue before storing the value.
+        self.gated_key = None
+        self.add_started = asyncio.Event()
+        self.add_continue = asyncio.Event()
+        # When set, aadd() raises this exception instead of storing.
+        self.add_error = None
+
+    async def aget(self, key, default=None, version=None):
+        return self._cache.get(self.make_key(key, version=version), default)
+
+    async def aadd(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
+        made_key = self.make_key(key, version=version)
+        self.add_calls += 1
+        if made_key == self.gated_key:
+            self.add_started.set()
+            await self.add_continue.wait()
+        if self.add_error is not None:
+            raise self.add_error
+        if made_key in self._cache:
+            return False
+        self._cache[made_key] = value
+        return True
+
+    async def aset(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
+        self._cache[self.make_key(key, version=version)] = value
+
+    async def adelete(self, key, version=None):
+        return self._cache.pop(self.make_key(key, version=version), None) is not None
+
+
+class AGetOrSetConcurrencyTests(SimpleTestCase):
+    """Concurrency behavior of BaseCache.aget_or_set()."""
+
+    def setUp(self):
+        self.cache = AGetOrSetStubCache({})
+
+    def gate_add(self, key, version=None):
+        self.cache.gated_key = self.cache.make_key(key, version=version)
+
+    async def test_concurrent_callers_share_single_generation(self):
+        """A caller arriving during generation waits for the same result,
+        even if it provides a different default."""
+        self.gate_add("key")
+        first_default = mock.Mock(return_value="first")
+        second_default = mock.Mock(return_value="second")
+        first = asyncio.create_task(self.cache.aget_or_set("key", first_default))
+        await self.cache.add_started.wait()
+        second = asyncio.create_task(self.cache.aget_or_set("key", second_default))
+        await asyncio.sleep(0)  # Let the second caller reach the wait.
+        self.assertFalse(second.done())
+        self.cache.add_continue.set()
+        self.assertEqual(await first, "first")
+        self.assertEqual(await second, "first")
+        first_default.assert_called_once()
+        second_default.assert_not_called()
+        self.assertEqual(self.cache.add_calls, 1)
+
+    async def test_concurrent_callers_share_failure(self):
+        """All callers waiting on a failed generation receive the same
+        failure, nothing is cached, and a later call retries."""
+        self.gate_add("key")
+        error = RuntimeError("generation failed")
+        self.cache.add_error = error
+        first = asyncio.create_task(self.cache.aget_or_set("key", lambda: "first"))
+        await self.cache.add_started.wait()
+        second = asyncio.create_task(self.cache.aget_or_set("key", lambda: "second"))
+        await asyncio.sleep(0)  # Let the second caller reach the wait.
+        self.cache.add_continue.set()
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        self.assertIs(results[0], error)
+        self.assertIs(results[1], error)
+        self.assertIsNone(await self.cache.aget("key"))
+        # The failure isn't latched: a later call computes the default again.
+        self.cache.add_error = None
+        self.assertEqual(await self.cache.aget_or_set("key", "recovered"), "recovered")
+
+    async def test_concurrent_plain_values_single_winner(self):
+        """Concurrent plain defaults leave a single winning value that all
+        callers observe."""
+        results = await asyncio.gather(
+            *(self.cache.aget_or_set("key", f"value-{i}") for i in range(5))
+        )
+        self.assertEqual(results, ["value-0"] * 5)
+        self.assertEqual(await self.cache.aget("key"), "value-0")
+        self.assertEqual(self.cache.add_calls, 1)
+
+    async def test_different_keys_do_not_block_each_other(self):
+        """Generation for one key doesn't block aget_or_set() for another."""
+        self.gate_add("a")
+        first = asyncio.create_task(self.cache.aget_or_set("a", lambda: "a"))
+        await self.cache.add_started.wait()
+        self.assertEqual(await self.cache.aget_or_set("b", lambda: "b"), "b")
+        self.assertFalse(first.done())
+        self.cache.add_continue.set()
+        self.assertEqual(await first, "a")
+
+    async def test_different_versions_are_independent(self):
+        """The same key with different versions is generated independently."""
+        self.gate_add("key", version=1)
+        first = asyncio.create_task(
+            self.cache.aget_or_set("key", lambda: "v1", version=1)
+        )
+        await self.cache.add_started.wait()
+        self.assertEqual(
+            await self.cache.aget_or_set("key", lambda: "v2", version=2), "v2"
+        )
+        self.cache.add_continue.set()
+        self.assertEqual(await first, "v1")
+        self.assertEqual(await self.cache.aget("key", version=1), "v1")
+        self.assertEqual(await self.cache.aget("key", version=2), "v2")
+
+    async def test_external_write_during_generation_wins(self):
+        """A value written by another writer while the default is being
+        stored isn't overwritten by the locally generated value."""
+        self.gate_add("key")
+        task = asyncio.create_task(self.cache.aget_or_set("key", lambda: "local"))
+        await self.cache.add_started.wait()
+        await self.cache.aset("key", "external")
+        self.cache.add_continue.set()
+        self.assertEqual(await task, "external")
+        self.assertEqual(await self.cache.aget("key"), "external")
+
+    async def test_existing_value_returned_without_generation(self):
+        """An existing value is returned as-is: the default isn't computed
+        and nothing is written back."""
+        await self.cache.aset("key", "cached")
+        default = mock.Mock(return_value="generated")
+        self.assertEqual(await self.cache.aget_or_set("key", default), "cached")
+        default.assert_not_called()
+        self.assertEqual(self.cache.add_calls, 0)
+
+    async def test_missing_key_recomputed_after_removal(self):
+        """Once the cached value is gone, the default is computed again."""
+        self.assertEqual(await self.cache.aget_or_set("key", lambda: "old"), "old")
+        await self.cache.adelete("key")
+        self.assertEqual(await self.cache.aget_or_set("key", lambda: "new"), "new")
 
 
 @override_settings(
