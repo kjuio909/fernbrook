@@ -1,5 +1,6 @@
 # Unit tests for cache framework
 # Uses whatever cache backend is set in the test settings file.
+import asyncio
 import copy
 import io
 import os
@@ -1166,6 +1167,159 @@ class BaseCacheTests:
             # default value should be returned.
             cache_add.return_value = False
             self.assertEqual(cache.get_or_set("key", "default"), "default")
+
+    async def test_aget_or_set_concurrent_miss_single_generation(self):
+        """Concurrent misses generate the default only once."""
+        calls = 0
+        gate = asyncio.Event()
+
+        async def default():
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+            return "value"
+
+        tasks = [
+            asyncio.create_task(cache.aget_or_set("key", default)) for _ in range(5)
+        ]
+        await asyncio.sleep(0.01)  # Let all callers reach the miss.
+        gate.set()
+        results = await asyncio.gather(*tasks)
+        self.assertEqual(calls, 1)
+        self.assertEqual(results, ["value"] * 5)
+        self.assertEqual(await cache.aget("key"), "value")
+
+    async def test_aget_or_set_concurrent_plain_defaults(self):
+        """Concurrent plain defaults resolve to a single cached winner."""
+        gate = asyncio.Event()
+
+        async def get(value):
+            await gate.wait()
+            return await cache.aget_or_set("key", value)
+
+        tasks = [asyncio.create_task(get(i)) for i in range(5)]
+        await asyncio.sleep(0.01)  # Let all callers wait on the gate.
+        gate.set()
+        results = await asyncio.gather(*tasks)
+        self.assertEqual(len(set(results)), 1)
+        self.assertEqual(await cache.aget("key"), results[0])
+
+    async def test_aget_or_set_concurrent_waiter_default_ignored(self):
+        """Waiters receive the in-flight result, not their own default."""
+        gate = asyncio.Event()
+
+        async def slow_default():
+            await gate.wait()
+            return "leader"
+
+        leader = asyncio.create_task(cache.aget_or_set("key", slow_default))
+        await asyncio.sleep(0.01)  # Let the leader register its generation.
+        waiter = asyncio.create_task(cache.aget_or_set("key", "waiter"))
+        await asyncio.sleep(0.01)
+        gate.set()
+        self.assertEqual(await leader, "leader")
+        self.assertEqual(await waiter, "leader")
+
+    async def test_aget_or_set_concurrent_different_keys(self):
+        """Misses for different keys don't block each other."""
+        gate = asyncio.Event()
+
+        async def slow_default():
+            await gate.wait()
+            return "slow"
+
+        slow_task = asyncio.create_task(cache.aget_or_set("slow_key", slow_default))
+        await asyncio.sleep(0.01)  # Let the slow generation start.
+        # A different key resolves without waiting for slow_key's generation.
+        self.assertEqual(await cache.aget_or_set("fast_key", "fast"), "fast")
+        gate.set()
+        self.assertEqual(await slow_task, "slow")
+
+    async def test_aget_or_set_concurrent_versions(self):
+        """The same key with different versions is generated independently."""
+        gate = asyncio.Event()
+        calls = []
+
+        def make_default(version):
+            async def default():
+                calls.append(version)
+                await gate.wait()
+                return "value-%s" % version
+
+            return default
+
+        tasks = [
+            asyncio.create_task(cache.aget_or_set("key", make_default(v), version=v))
+            for v in (1, 2)
+        ]
+        await asyncio.sleep(0.01)  # Let both generations start.
+        gate.set()
+        results = await asyncio.gather(*tasks)
+        self.assertEqual(results, ["value-1", "value-2"])
+        self.assertEqual(sorted(calls), [1, 2])
+        self.assertEqual(await cache.aget("key", version=1), "value-1")
+        self.assertEqual(await cache.aget("key", version=2), "value-2")
+
+    async def test_aget_or_set_concurrent_miss_shared_failure(self):
+        """
+        A failing default propagates the same failure to every waiter, leaves
+        no cache entry, and a later call may retry.
+        """
+        calls = 0
+        gate = asyncio.Event()
+
+        async def default():
+            nonlocal calls
+            calls += 1
+            await gate.wait()
+            raise ValueError("boom")
+
+        tasks = [
+            asyncio.create_task(cache.aget_or_set("key", default)) for _ in range(5)
+        ]
+        await asyncio.sleep(0.01)  # Let all callers reach the miss.
+        gate.set()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        self.assertEqual(calls, 1)
+        for result in results:
+            self.assertIsInstance(result, ValueError)
+            self.assertIs(result, results[0])
+        self.assertIsNone(await cache.aget("key"))
+        # A later call recomputes.
+        self.assertEqual(await cache.aget_or_set("key", "recovered"), "recovered")
+        self.assertEqual(await cache.aget("key"), "recovered")
+
+    async def test_aget_or_set_existing_value_no_generation(self):
+        """An existing value is returned without calling the default."""
+        await cache.aset("key", "value")
+        called = False
+
+        def default():
+            nonlocal called
+            called = True
+            return "other"
+
+        results = await asyncio.gather(
+            *[cache.aget_or_set("key", default) for _ in range(3)]
+        )
+        self.assertEqual(results, ["value"] * 3)
+        self.assertIs(called, False)
+
+    async def test_aget_or_set_external_writer_wins(self):
+        """A value written during generation isn't overwritten."""
+
+        async def default():
+            await cache.aset("key", "winner")
+            return "generated"
+
+        self.assertEqual(await cache.aget_or_set("key", default), "winner")
+        self.assertEqual(await cache.aget("key"), "winner")
+
+    async def test_aget_or_set_recomputes_after_delete(self):
+        """Once the entry is gone, a later call enters the miss flow again."""
+        self.assertEqual(await cache.aget_or_set("key", "one"), "one")
+        await cache.adelete("key")
+        self.assertEqual(await cache.aget_or_set("key", "two"), "two")
 
     async def test_get_many_async_uses_specialized_implementation(self):
         if (

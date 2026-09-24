@@ -1,5 +1,6 @@
 "Base Cache class."
 
+import asyncio
 import time
 import warnings
 
@@ -83,6 +84,10 @@ class BaseCache:
         self.key_prefix = params.get("KEY_PREFIX", "")
         self.version = params.get("VERSION", 1)
         self.key_func = get_key_func(params.get("KEY_FUNCTION"))
+        # In-flight aget_or_set() default generations, keyed by the fully
+        # constructed cache key so that versions (and custom key functions)
+        # are treated as distinct cache entries.
+        self._aget_or_set_in_flight = {}
 
     def get_backend_timeout(self, timeout=DEFAULT_TIMEOUT):
         """
@@ -244,15 +249,46 @@ class BaseCache:
             return await sync_to_async(self.get_or_set, thread_sensitive=True)(
                 key, default, timeout=timeout, version=version
             )
+        made_key = self.make_key(key, version=version)
+        # Coalesce concurrent misses for the same cache entry: only the first
+        # caller generates the default, every other concurrent caller waits
+        # for (and receives) the very same result or failure. Different keys
+        # (including different versions) have separate futures and never block
+        # each other.
+        in_flight = self._aget_or_set_in_flight.get(made_key)
+        if in_flight is not None:
+            return await asyncio.shield(in_flight)
+        future = asyncio.get_running_loop().create_future()
+        self._aget_or_set_in_flight[made_key] = future
+        try:
+            result = await self._aget_or_set_generate(key, default, timeout, version)
+            future.set_result(result)
+        except BaseException as exc:
+            future.set_exception(exc)
+            raise
+        finally:
+            self._aget_or_set_in_flight.pop(made_key, None)
+        return result
+
+    async def _aget_or_set_generate(self, key, default, timeout, version):
         val = await self.aget(key, self._missing_key, version=version)
-        if val is self._missing_key:
-            if callable(default):
-                default = default()
-            await self.aadd(key, default, timeout=timeout, version=version)
-            # Fetch the value again to avoid a race condition if another caller
-            # added a value between the first aget() and the aadd() above.
-            return await self.aget(key, default, version=version)
-        return val
+        if val is not self._missing_key:
+            # The entry was populated before this generation started; return
+            # it without resetting its expiry.
+            return val
+        if callable(default):
+            default = await self._acall_default(default)
+        await self.aadd(key, default, timeout=timeout, version=version)
+        # Fetch the value again to avoid a race condition if another writer
+        # added a value between the first aget() and the aadd() above: the
+        # value already in the cache wins and must not be overwritten.
+        return await self.aget(key, default, version=version)
+
+    async def _acall_default(self, default):
+        result = default()
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
 
     def has_key(self, key, version=None):
         """
