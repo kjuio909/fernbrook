@@ -1,6 +1,7 @@
 "Base Cache class."
 
 import asyncio
+import inspect
 import threading
 import time
 import warnings
@@ -54,6 +55,42 @@ class _InFlightGeneration:
     def fail(self, exc):
         self.exception = exc
         self.event.set()
+
+
+class _AsyncInFlightGeneration:
+    """
+    Coordination point for a single round of concurrent aget_or_set() misses.
+
+    A dedicated task runs the default generation and holds the round's single
+    outcome: a value or an exception. Every other caller coalescing on the
+    same cache entry joins the round and awaits that very same task, so
+    cancelling one waiter cannot cancel a generation that still has
+    participants.
+
+    ``participants`` counts callers that have joined the round and not yet left
+    it. When it reaches zero the round is detached from the registry before
+    the generation task is abandoned, so a cancelled round can never be
+    mistaken for the next one and no later caller can observe a half-abandoned
+    task.
+    """
+
+    __slots__ = ("task", "participants")
+
+    def __init__(self, coro):
+        self.task = asyncio.ensure_future(coro)
+        self.participants = 1
+
+    def join(self):
+        self.participants += 1
+
+
+def _discard_generation_result(task):
+    # Retire the outcome of a generation task once the round is over so an
+    # abandoned failure isn't reported as "exception was never retrieved". The
+    # outcome belongs to whoever awaited the round; once nobody is left there
+    # is no one to surface it to.
+    if not task.cancelled():
+        task.exception()
 
 
 # Stub class to ensure not passing in a `timeout` argument results in
@@ -326,25 +363,46 @@ class BaseCache:
                 key, default, timeout=timeout, version=version
             )
         made_key = self.make_key(key, version=version)
-        # Coalesce concurrent misses for the same cache entry: only the first
-        # caller generates the default, every other concurrent caller waits
-        # for (and receives) the very same result or failure. Different keys
-        # (including different versions) have separate futures and never block
-        # each other.
+        # Coalesce concurrent misses for the same cache entry: only one
+        # generation runs per round, and every participant observes its very
+        # same value or failure. Different keys (including different versions)
+        # have separate rounds and never block each other. The registry is
+        # only touched at synchronous points here, so it needs no lock.
         in_flight = self._aget_or_set_in_flight.get(made_key)
         if in_flight is not None:
-            return await asyncio.shield(in_flight)
-        future = asyncio.get_running_loop().create_future()
-        self._aget_or_set_in_flight[made_key] = future
+            in_flight.join()
+        else:
+            in_flight = _AsyncInFlightGeneration(
+                self._aget_or_set_generate(key, default, timeout, version)
+            )
+            self._aget_or_set_in_flight[made_key] = in_flight
         try:
-            result = await self._aget_or_set_generate(key, default, timeout, version)
-            future.set_result(result)
-        except BaseException as exc:
-            future.set_exception(exc)
-            raise
+            # Shield the shared generation task from this participant's
+            # cancellation. Whether a still-running generation is abandoned
+            # is decided below by the participant count, never by a single
+            # participant's cancellation.
+            return await asyncio.shield(in_flight.task)
         finally:
-            self._aget_or_set_in_flight.pop(made_key, None)
-        return result
+            in_flight.participants -= 1
+            task = in_flight.task
+            if task.done():
+                # The round reached an outcome. Only detach the generation of
+                # the current round (identity checked), so a round that
+                # started after the outcome became visible is untouched.
+                if self._aget_or_set_in_flight.get(made_key) is in_flight:
+                    self._aget_or_set_in_flight.pop(made_key, None)
+                    _discard_generation_result(task)
+            elif in_flight.participants == 0:
+                # The last participant left while the generation was still
+                # running, which can only be its own cancellation. Detach the
+                # round from the registry before abandoning it, so the next
+                # caller starts a fresh round and can never observe this one.
+                # The generation never deletes entries, so a value committed
+                # by another writer is left in place.
+                if self._aget_or_set_in_flight.get(made_key) is in_flight:
+                    self._aget_or_set_in_flight.pop(made_key, None)
+                task.add_done_callback(_discard_generation_result)
+                task.cancel()
 
     async def _aget_or_set_generate(self, key, default, timeout, version):
         val = await self.aget(key, self._missing_key, version=version)
@@ -362,8 +420,8 @@ class BaseCache:
 
     async def _acall_default(self, default):
         result = default()
-        if asyncio.iscoroutine(result):
-            return await result
+        if inspect.isawaitable(result):
+            result = await result
         return result
 
     def has_key(self, key, version=None):
