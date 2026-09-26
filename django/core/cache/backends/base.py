@@ -56,6 +56,46 @@ class _InFlightGeneration:
         self.event.set()
 
 
+class _AInFlightGeneration:
+    """
+    Coordination point for a single round of concurrent aget_or_set() misses.
+
+    The generation runs once, in a background task, independently of the
+    coroutine that started it. Every participant -- the initiating caller and
+    every concurrent caller coalescing on the same cache entry -- owns a
+    private future and therefore may be cancelled individually without
+    cancelling the generation: a participant's cancellation only drops its own
+    future. The background task is cancelled (abandoning the round) solely when
+    the last participant leaves, so a round with participants always runs to
+    completion and no half-finished state is observable.
+    """
+
+    def __init__(self):
+        self.futures = set()
+        self.task = None
+        # Set once the outcome has been delivered (or the round was abandoned).
+        self.done = False
+
+    def add_future(self, loop):
+        future = loop.create_future()
+        self.futures.add(future)
+        return future
+
+    def discard_future(self, future):
+        self.futures.discard(future)
+
+    def deliver(self, outcome):
+        """Resolve every live participant future with value or exception."""
+        value, exception = outcome
+        self.done = True
+        for future in self.futures:
+            if not future.done():
+                if exception is None:
+                    future.set_result(value)
+                else:
+                    future.set_exception(exception)
+
+
 # Stub class to ensure not passing in a `timeout` argument results in
 # the default timeout
 DEFAULT_TIMEOUT = object()
@@ -119,7 +159,9 @@ class BaseCache:
         self.key_func = get_key_func(params.get("KEY_FUNCTION"))
         # In-flight aget_or_set() default generations, keyed by the fully
         # constructed cache key so that versions (and custom key functions)
-        # are treated as distinct cache entries.
+        # are treated as distinct cache entries. Each entry is an
+        # _AInFlightGeneration shared by all coroutines coalescing on the
+        # same cache entry.
         self._aget_or_set_in_flight = {}
         # In-flight get_or_set() default generations, likewise keyed by the
         # fully constructed cache key. Each entry is an _InFlightGeneration
@@ -326,25 +368,72 @@ class BaseCache:
                 key, default, timeout=timeout, version=version
             )
         made_key = self.make_key(key, version=version)
+        loop = asyncio.get_running_loop()
         # Coalesce concurrent misses for the same cache entry: only the first
-        # caller generates the default, every other concurrent caller waits
-        # for (and receives) the very same result or failure. Different keys
-        # (including different versions) have separate futures and never block
-        # each other.
+        # caller starts the default generation, every other concurrent caller
+        # waits for (and receives) the very same result or failure. Different
+        # keys (including different versions) have separate rounds and never
+        # block each other. The generation runs in a background task and each
+        # participant owns a private future, so cancelling one participant
+        # only detaches that participant; the round is abandoned (and the
+        # generation task cancelled) only when the last participant leaves.
         in_flight = self._aget_or_set_in_flight.get(made_key)
-        if in_flight is not None:
-            return await asyncio.shield(in_flight)
-        future = asyncio.get_running_loop().create_future()
-        self._aget_or_set_in_flight[made_key] = future
+        if in_flight is None:
+            in_flight = _AInFlightGeneration()
+            self._aget_or_set_in_flight[made_key] = in_flight
+            in_flight.task = loop.create_task(
+                self._aget_or_set_run(
+                    in_flight, made_key, key, default, timeout, version
+                )
+            )
+        future = in_flight.add_future(loop)
         try:
-            result = await self._aget_or_set_generate(key, default, timeout, version)
-            future.set_result(result)
-        except BaseException as exc:
-            future.set_exception(exc)
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            # This participant is gone, but the generation keeps running as
+            # long as other participants remain. The check and registry
+            # update happen without an await, so a round is abandoned exactly
+            # once and a fresh round can't be detached by mistake.
+            in_flight.discard_future(future)
+            # Consume an exception delivered concurrently with the
+            # cancellation so it isn't reported as never retrieved. On a
+            # done, non-cancelled future .exception() returns None for a
+            # plain result and never raises.
+            if future.done() and not future.cancelled():
+                future.exception()
+            if not in_flight.done and not in_flight.futures:
+                if self._aget_or_set_in_flight.get(made_key) is in_flight:
+                    del self._aget_or_set_in_flight[made_key]
+                in_flight.task.cancel()
             raise
+
+    async def _aget_or_set_run(
+        self, in_flight, made_key, key, default, timeout, version
+    ):
+        """Run one generation round and report its outcome to participants."""
+        try:
+            result = await self._aget_or_set_generate(
+                key, default, timeout, version
+            )
+        except asyncio.CancelledError:
+            # The last participant detached while the generation was in
+            # flight: the round was abandoned before committing. Nothing is
+            # deleted and a later call starts a fresh round.
+            raise
+        except BaseException as exc:
+            # Propagate the failure as-is to everyone still waiting; with no
+            # participants left the round was abandoned and the error has no
+            # recipient, so swallow it and let a later call retry.
+            if in_flight.futures:
+                in_flight.deliver((None, exc))
+        else:
+            if in_flight.futures:
+                in_flight.deliver((result, None))
         finally:
-            self._aget_or_set_in_flight.pop(made_key, None)
-        return result
+            # Only remove our own round: a fresh round for the same key may
+            # have started after the last participant abandoned this one.
+            if self._aget_or_set_in_flight.get(made_key) is in_flight:
+                del self._aget_or_set_in_flight[made_key]
 
     async def _aget_or_set_generate(self, key, default, timeout, version):
         val = await self.aget(key, self._missing_key, version=version)

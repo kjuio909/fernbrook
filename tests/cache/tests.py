@@ -1669,6 +1669,238 @@ class BaseCacheTests:
         await cache.adelete("key")
         self.assertEqual(await cache.aget_or_set("key", "two"), "two")
 
+    async def _wait_for_aget_or_set_round(
+        self, concrete_cache, key, participants=1, timeout=5
+    ):
+        """Wait until a generation round with enough participants is registered."""
+        made_key = concrete_cache.make_key(key)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            in_flight = concrete_cache._aget_or_set_in_flight.get(made_key)
+            if (
+                in_flight is not None
+                and in_flight.task is not None
+                and len(in_flight.futures) >= participants
+            ):
+                return in_flight
+            await asyncio.sleep(0.005)
+        self.fail("Timed out waiting for an in-flight aget_or_set() round.")
+
+    async def test_aget_or_set_cancel_one_waiter_keeps_generation(self):
+        """Cancelling a waiter doesn't cancel a round that still has participants."""
+        concrete_cache = caches["default"]
+        calls = 0
+        gate = asyncio.Event()
+        started = asyncio.Event()
+
+        async def default():
+            nonlocal calls
+            calls += 1
+            started.set()
+            await gate.wait()
+            return "value"
+
+        leader = asyncio.create_task(cache.aget_or_set("key", default))
+        await started.wait()
+        cancelled_waiter = asyncio.create_task(cache.aget_or_set("key", "other"))
+        waiter = asyncio.create_task(cache.aget_or_set("key", "other-too"))
+        await self._wait_for_aget_or_set_round(concrete_cache, "key", 3)
+        cancelled_waiter.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled_waiter
+        # The generation keeps running for the remaining participants.
+        self.assertFalse(leader.done())
+        gate.set()
+        self.assertEqual(await leader, "value")
+        self.assertEqual(await waiter, "value")
+        self.assertEqual(calls, 1)
+        self.assertEqual(await cache.aget("key"), "value")
+
+    async def test_aget_or_set_cancel_leader_with_waiters(self):
+        """The initiating call is just another participant; waiters survive it."""
+        concrete_cache = caches["default"]
+        gate = asyncio.Event()
+        started = asyncio.Event()
+
+        async def default():
+            started.set()
+            await gate.wait()
+            return "value"
+
+        leader = asyncio.create_task(cache.aget_or_set("key", default))
+        await started.wait()
+        waiters = [
+            asyncio.create_task(cache.aget_or_set("key", i)) for i in range(2)
+        ]
+        await self._wait_for_aget_or_set_round(concrete_cache, "key", 3)
+        leader.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await leader
+        # The round is still in flight and completes for the waiters.
+        self.assertIsNotNone(
+            concrete_cache._aget_or_set_in_flight.get(concrete_cache.make_key("key"))
+        )
+        gate.set()
+        self.assertEqual(await asyncio.gather(*waiters), ["value", "value"])
+        self.assertEqual(await cache.aget("key"), "value")
+
+    async def test_aget_or_set_cancel_all_abandons_round(self):
+        """When every participant cancels, the round is abandoned and retryable."""
+        concrete_cache = caches["default"]
+        calls = 0
+        gate = asyncio.Event()
+        started = asyncio.Event()
+        generation_cancelled = asyncio.Event()
+
+        async def default():
+            nonlocal calls
+            calls += 1
+            started.set()
+            try:
+                await gate.wait()
+            except asyncio.CancelledError:
+                generation_cancelled.set()
+                raise
+            return "value"
+
+        leader = asyncio.create_task(cache.aget_or_set("key", default))
+        await started.wait()
+        waiters = [
+            asyncio.create_task(cache.aget_or_set("key", i)) for i in range(3)
+        ]
+        await self._wait_for_aget_or_set_round(concrete_cache, "key", 4)
+        tasks = [leader, *waiters]
+        for task in tasks:
+            task.cancel()
+        outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        self.assertTrue(
+            all(isinstance(outcome, asyncio.CancelledError) for outcome in outcomes)
+        )
+        # The in-flight default was cancelled before committing and no state
+        # dangles, so nothing was stored and a later call regenerates.
+        await asyncio.wait_for(generation_cancelled.wait(), timeout=5)
+        self.assertEqual(
+            concrete_cache._aget_or_set_in_flight.get(
+                concrete_cache.make_key("key")
+            ),
+            None,
+        )
+        self.assertIsNone(await cache.aget("key"))
+        self.assertEqual(await cache.aget_or_set("key", "retry"), "retry")
+        self.assertEqual(calls, 1)
+        self.assertEqual(await cache.aget("key"), "retry")
+
+    async def test_aget_or_set_cancel_waiter_then_failure(self):
+        """A failure still reaches every remaining waiter after a cancellation."""
+
+        class GenerationError(Exception):
+            pass
+
+        error = GenerationError("boom")
+        concrete_cache = caches["default"]
+        gate = asyncio.Event()
+        started = asyncio.Event()
+
+        async def default():
+            started.set()
+            await gate.wait()
+            raise error
+
+        leader = asyncio.create_task(cache.aget_or_set("key", default))
+        await started.wait()
+        cancelled_waiter = asyncio.create_task(cache.aget_or_set("key", "other"))
+        waiter = asyncio.create_task(cache.aget_or_set("key", "other-too"))
+        await self._wait_for_aget_or_set_round(concrete_cache, "key", 3)
+        cancelled_waiter.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled_waiter
+        gate.set()
+        outcomes = await asyncio.gather(leader, waiter, return_exceptions=True)
+        self.assertEqual(len(outcomes), 2)
+        self.assertIs(outcomes[0], error)
+        self.assertIs(outcomes[1], error)
+        self.assertIsNone(await cache.aget("key"))
+        # The failure cleans up the round and a later call may retry.
+        self.assertEqual(await cache.aget_or_set("key", "recovered"), "recovered")
+
+    async def test_aget_or_set_in_flight_value_invisible(self):
+        """Public reads during generation see missing or external writes only."""
+        concrete_cache = caches["default"]
+        gate = asyncio.Event()
+        started = asyncio.Event()
+
+        async def default():
+            started.set()
+            await gate.wait()
+            return "generated"
+
+        leader = asyncio.create_task(cache.aget_or_set("key", default))
+        await started.wait()
+        waiters = [
+            asyncio.create_task(cache.aget_or_set("key", i)) for i in range(3)
+        ]
+        await self._wait_for_aget_or_set_round(concrete_cache, "key", 4)
+        # The local, in-flight result is not observable through public reads.
+        self.assertIsNone(await cache.aget("key"))
+        self.assertIs(await cache.ahas_key("key"), False)
+        gate.set()
+        # The externally committed value wins for the whole round.
+        self.assertEqual(await asyncio.gather(leader, *waiters), ["generated"] * 4)
+
+    async def test_aget_or_set_concurrent_external_writer_wins(self):
+        """A value written during generation wins for everyone in the round."""
+        concrete_cache = caches["default"]
+        gate = asyncio.Event()
+        started = asyncio.Event()
+
+        async def default():
+            started.set()
+            await gate.wait()
+            return "generated"
+
+        leader = asyncio.create_task(cache.aget_or_set("key", default))
+        await started.wait()
+        waiters = [
+            asyncio.create_task(cache.aget_or_set("key", i)) for i in range(3)
+        ]
+        await self._wait_for_aget_or_set_round(concrete_cache, "key", 4)
+        await cache.aset("key", "winner")
+        gate.set()
+        self.assertEqual(
+            await asyncio.gather(leader, *waiters), ["winner"] * 4
+        )
+        self.assertEqual(await cache.aget("key"), "winner")
+
+    async def test_aget_or_set_zero_timeout(self):
+        """An explicit zero timeout returns the value without storing it."""
+        self.assertEqual(await cache.aget_or_set("key", "eggs", 0), "eggs")
+        self.assertIsNone(await cache.aget("key"))
+
+    async def test_aget_or_set_concurrent_waiter_timeout_ignored(self):
+        """A waiter's timeout can't change the generation's write strategy."""
+        concrete_cache = caches["default"]
+        gate = asyncio.Event()
+        started = asyncio.Event()
+
+        async def slow_default():
+            started.set()
+            await gate.wait()
+            return "value"
+
+        leader = asyncio.create_task(
+            cache.aget_or_set("key", slow_default, timeout=None)
+        )
+        await started.wait()
+        waiter = asyncio.create_task(cache.aget_or_set("key", "other", timeout=1))
+        await self._wait_for_aget_or_set_round(concrete_cache, "key", 2)
+        gate.set()
+        self.assertEqual(await asyncio.gather(leader, waiter), ["value", "value"])
+        # The waiter's one-second timeout didn't apply: the leader stored the
+        # value without an expiration.
+        await asyncio.sleep(1.2)
+        self.assertEqual(await cache.aget("key"), "value")
+
+
     async def test_get_many_async_uses_specialized_implementation(self):
         if (
             cache.get_many.__func__ is not BaseCache.get_many
