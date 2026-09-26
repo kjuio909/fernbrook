@@ -1168,6 +1168,354 @@ class BaseCacheTests:
             cache_add.return_value = False
             self.assertEqual(cache.get_or_set("key", "default"), "default")
 
+    # Cache instances are thread-local, so the concrete cache instance must be
+    # captured in the main thread and passed explicitly to threads that should
+    # coalesce with each other.
+    def _start_get_or_set_threads(self, concrete_cache, target, count):
+        """
+        Start *count* threads running target(i) against concrete_cache. Return
+        the threads and the per-thread results and exceptions lists. Each
+        thread closes the database connections it opened, which otherwise keep
+        locks on the shared in-memory test database.
+        """
+        results = [None] * count
+        exceptions = [None] * count
+
+        def runner(i):
+            try:
+                results[i] = target(i)
+            except BaseException as exc:
+                exceptions[i] = exc
+            finally:
+                for conn in connections.all(initialized_only=True):
+                    conn.close()
+
+        threads = [threading.Thread(target=runner, args=(i,)) for i in range(count)]
+        for thread in threads:
+            thread.start()
+        return threads, results, exceptions
+
+    def _join_get_or_set_threads(self, threads, timeout=5):
+        for thread in threads:
+            thread.join(timeout)
+            self.assertFalse(thread.is_alive(), "get_or_set() thread timed out")
+
+    def _wait_for_get_or_set_waiters(self, concrete_cache, key, count, timeout=5):
+        """Wait until *count* threads are waiting on the key's generation."""
+        made_key = concrete_cache.make_key(key)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with concrete_cache._get_or_set_lock:
+                in_flight = concrete_cache._get_or_set_in_flight.get(made_key)
+                if in_flight is not None and in_flight.waiters >= count:
+                    return
+            time.sleep(0.005)
+        self.fail("Timed out waiting for %s in-flight waiters." % count)
+
+    def test_get_or_set_concurrent_miss_single_generation(self):
+        """Concurrent misses generate the callable default only once."""
+        concrete_cache = caches["default"]
+        call_count = 0
+        count_lock = threading.Lock()
+        gate = threading.Event()
+
+        def default():
+            nonlocal call_count
+            with count_lock:
+                call_count += 1
+            gate.wait(5)
+            return "value"
+
+        def get(i):
+            return concrete_cache.get_or_set("key", default)
+
+        threads, results, exceptions = self._start_get_or_set_threads(
+            concrete_cache, get, 5
+        )
+        try:
+            self._wait_for_get_or_set_waiters(concrete_cache, "key", 4)
+            gate.set()
+        finally:
+            # Releasing the gate is required even if the assertion above fails.
+            gate.set()
+            self._join_get_or_set_threads(threads)
+        self.assertEqual(call_count, 1)
+        self.assertEqual(results, ["value"] * 5)
+        self.assertEqual(exceptions, [None] * 5)
+        self.assertEqual(cache.get("key"), "value")
+
+    def test_get_or_set_concurrent_plain_defaults(self):
+        """Concurrent plain defaults resolve to a single cached winner."""
+        concrete_cache = caches["default"]
+        barrier = threading.Barrier(5)
+
+        def get(i):
+            barrier.wait(5)
+            return concrete_cache.get_or_set("key", i)
+
+        threads, results, exceptions = self._start_get_or_set_threads(
+            concrete_cache, get, 5
+        )
+        self._join_get_or_set_threads(threads)
+        self.assertEqual(exceptions, [None] * 5)
+        self.assertEqual(len(set(results)), 1)
+        self.assertEqual(cache.get("key"), results[0])
+
+    def test_get_or_set_concurrent_waiter_default_ignored(self):
+        """Waiters receive the in-flight result, not their own default."""
+        concrete_cache = caches["default"]
+        gate = threading.Event()
+
+        def slow_default():
+            gate.wait(5)
+            return "leader"
+
+        leader_threads, leader_results, _ = self._start_get_or_set_threads(
+            concrete_cache,
+            lambda i: concrete_cache.get_or_set("key", slow_default),
+            1,
+        )
+        try:
+            self._wait_for_get_or_set_waiters(concrete_cache, "key", 0)
+            waiter_threads, waiter_results, _ = self._start_get_or_set_threads(
+                concrete_cache,
+                lambda i: concrete_cache.get_or_set("key", "waiter"),
+                1,
+            )
+            self._wait_for_get_or_set_waiters(concrete_cache, "key", 1)
+            gate.set()
+            self._join_get_or_set_threads(waiter_threads)
+        finally:
+            gate.set()
+            self._join_get_or_set_threads(leader_threads)
+        self.assertEqual(leader_results[0], "leader")
+        self.assertEqual(waiter_results[0], "leader")
+
+    def test_get_or_set_concurrent_different_keys(self):
+        """Misses for different keys don't block each other."""
+        concrete_cache = caches["default"]
+        started = threading.Event()
+        gate = threading.Event()
+
+        def slow_default():
+            started.set()
+            gate.wait(5)
+            return "slow"
+
+        slow_threads, slow_results, _ = self._start_get_or_set_threads(
+            concrete_cache,
+            lambda i: concrete_cache.get_or_set("slow_key", slow_default),
+            1,
+        )
+        try:
+            self.assertTrue(started.wait(5))
+            # A different key resolves without waiting for slow_key's
+            # generation.
+            self.assertEqual(cache.get_or_set("fast_key", "fast"), "fast")
+        finally:
+            gate.set()
+            self._join_get_or_set_threads(slow_threads)
+        self.assertEqual(slow_results[0], "slow")
+
+    def test_get_or_set_concurrent_versions(self):
+        """The same key with different versions is generated independently."""
+        concrete_cache = caches["default"]
+        call_count = {1: 0, 2: 0}
+        count_lock = threading.Lock()
+        started = {1: threading.Event(), 2: threading.Event()}
+        # The generations run concurrently, but each is released separately so
+        # that their cache writes don't overlap -- some backends (notably the
+        # SQLite test database) serialize concurrent writers.
+        gates = {1: threading.Event(), 2: threading.Event()}
+
+        def make_default(version):
+            def default():
+                with count_lock:
+                    call_count[version] += 1
+                started[version].set()
+                gates[version].wait(5)
+                return "value-%s" % version
+
+            return default
+
+        def get(i):
+            version = (1, 2)[i]
+            return concrete_cache.get_or_set(
+                "key", make_default(version), version=version
+            )
+
+        threads, results, _ = self._start_get_or_set_threads(concrete_cache, get, 2)
+        try:
+            self.assertTrue(started[1].wait(5))
+            self.assertTrue(started[2].wait(5))
+            # Both generations are in flight simultaneously. Release each one
+            # only after the previous has fully committed so that concurrent
+            # cache writes don't overlap -- some backends (notably the SQLite
+            # test database) serialize concurrent writers.
+            gates[1].set()
+            threads[0].join(5)
+            self.assertFalse(threads[0].is_alive())
+            gates[2].set()
+        finally:
+            for event in gates.values():
+                event.set()
+            self._join_get_or_set_threads(threads)
+        self.assertEqual(results, ["value-1", "value-2"])
+        self.assertEqual(call_count, {1: 1, 2: 1})
+        self.assertEqual(cache.get("key", version=1), "value-1")
+        self.assertEqual(cache.get("key", version=2), "value-2")
+
+    def test_get_or_set_concurrent_miss_shared_failure(self):
+        """
+        A failing default propagates the same failure to every waiter, leaves
+        no cache entry, and a later call may retry.
+        """
+
+        class GenerationError(Exception):
+            pass
+
+        concrete_cache = caches["default"]
+        error = GenerationError("boom")
+        gate = threading.Event()
+
+        def default():
+            gate.wait(5)
+            # Simulate an external value landing in the cache during the
+            # generation; the subsequent failure must not delete it.
+            concrete_cache.set("key", "external")
+            raise error
+
+        threads, results, exceptions = self._start_get_or_set_threads(
+            concrete_cache,
+            lambda i: concrete_cache.get_or_set("key", default),
+            5,
+        )
+        try:
+            self._wait_for_get_or_set_waiters(concrete_cache, "key", 4)
+            gate.set()
+        finally:
+            gate.set()
+            self._join_get_or_set_threads(threads)
+        self.assertEqual(results, [None] * 5)
+        for exc in exceptions:
+            self.assertIs(exc, error)
+        self.assertEqual(cache.get("key"), "external")
+        # A later call observes the existing value without regenerating.
+        self.assertEqual(cache.get_or_set("key", default), "external")
+        # Once the entry is gone, generation may be retried.
+        cache.delete("key")
+        self.assertEqual(cache.get_or_set("key", "recovered"), "recovered")
+        self.assertEqual(cache.get("key"), "recovered")
+
+    def test_get_or_set_existing_value_no_generation(self):
+        """An existing value is returned without calling the default."""
+        concrete_cache = caches["default"]
+        cache.set("key", "value")
+        call_count = 0
+        count_lock = threading.Lock()
+        barrier = threading.Barrier(3)
+
+        def default():
+            nonlocal call_count
+            with count_lock:
+                call_count += 1
+            return "other"
+
+        def get(i):
+            barrier.wait(5)
+            return concrete_cache.get_or_set("key", default)
+
+        threads, results, exceptions = self._start_get_or_set_threads(
+            concrete_cache, get, 3
+        )
+        self._join_get_or_set_threads(threads)
+        self.assertEqual(results, ["value"] * 3)
+        self.assertEqual(exceptions, [None] * 3)
+        self.assertEqual(call_count, 0)
+
+    def test_get_or_set_external_writer_wins(self):
+        """A value written during generation isn't overwritten."""
+
+        def default():
+            cache.set("key", "winner")
+            return "generated"
+
+        self.assertEqual(cache.get_or_set("key", default), "winner")
+        self.assertEqual(cache.get("key"), "winner")
+
+    def test_get_or_set_concurrent_external_writer_wins(self):
+        """A value written during generation wins for everyone in the round."""
+        concrete_cache = caches["default"]
+        gate = threading.Event()
+
+        def slow_default():
+            gate.wait(5)
+            # Simulate another writer filling the key before the generated
+            # value is committed: that value must win for the whole round.
+            concrete_cache.set("key", "winner")
+            return "generated"
+
+        threads, results, exceptions = self._start_get_or_set_threads(
+            concrete_cache,
+            lambda i: concrete_cache.get_or_set("key", slow_default),
+            4,
+        )
+        try:
+            self._wait_for_get_or_set_waiters(concrete_cache, "key", 3)
+            gate.set()
+        finally:
+            gate.set()
+            self._join_get_or_set_threads(threads)
+        self.assertEqual(exceptions, [None] * 4)
+        self.assertEqual(results, ["winner"] * 4)
+        self.assertEqual(cache.get("key"), "winner")
+
+    def test_get_or_set_zero_timeout(self):
+        """An explicit zero timeout returns the value without storing it."""
+        self.assertEqual(cache.get_or_set("key", "eggs", 0), "eggs")
+        self.assertIsNone(cache.get("key"))
+
+    @retry()
+    def test_get_or_set_concurrent_waiter_timeout_ignored(self):
+        """A waiter's timeout can't change the generation's write strategy."""
+        concrete_cache = caches["default"]
+        gate = threading.Event()
+
+        def slow_default():
+            gate.wait(5)
+            return "value"
+
+        leader_threads, leader_results, _ = self._start_get_or_set_threads(
+            concrete_cache,
+            lambda i: concrete_cache.get_or_set("key", slow_default, timeout=None),
+            1,
+        )
+        try:
+            self._wait_for_get_or_set_waiters(concrete_cache, "key", 0)
+            waiter_threads, waiter_results, _ = self._start_get_or_set_threads(
+                concrete_cache,
+                lambda i: concrete_cache.get_or_set("key", "other", timeout=1),
+                1,
+            )
+            self._wait_for_get_or_set_waiters(concrete_cache, "key", 1)
+            gate.set()
+            self._join_get_or_set_threads(waiter_threads)
+        finally:
+            gate.set()
+            self._join_get_or_set_threads(leader_threads)
+        self.assertEqual(leader_results, ["value"])
+        self.assertEqual(waiter_results, ["value"])
+        # The waiter's one-second timeout didn't apply: the leader stored the
+        # value without an expiration.
+        time.sleep(1.2)
+        self.assertEqual(cache.get("key"), "value")
+
+    def test_get_or_set_recomputes_after_delete(self):
+        """Once the entry is gone, a later call enters the miss flow again."""
+        self.assertEqual(cache.get_or_set("key", "one"), "one")
+        cache.delete("key")
+        self.assertEqual(cache.get_or_set("key", "two"), "two")
+
     async def test_aget_or_set_concurrent_miss_single_generation(self):
         """Concurrent misses generate the default only once."""
         calls = 0
@@ -1665,6 +2013,26 @@ class LocMemCacheTests(BaseCacheTests, TestCase):
         self.assertEqual(expire, cache._expire_info[_key])
         self.assertEqual(cache.decr(key), 1)
         self.assertEqual(expire, cache._expire_info[_key])
+
+    def test_get_or_set_default_timeout(self):
+        """An omitted timeout stores the entry with the default timeout."""
+        cache.get_or_set("key", "value")
+        expiry = cache._expire_info[cache.make_key("key")]
+        self.assertIsNotNone(expiry)
+        self.assertAlmostEqual(expiry, time.time() + cache.default_timeout, delta=5)
+
+    def test_get_or_set_none_timeout(self):
+        """An explicit None timeout stores a non-expiring entry."""
+        cache.get_or_set("key", "value", timeout=None)
+        self.assertIsNone(cache._expire_info[cache.make_key("key")])
+
+    def test_get_or_set_existing_value_does_not_extend_expiry(self):
+        """Reading an existing entry doesn't reset its expiry."""
+        cache.set("key", "value", timeout=100)
+        expiry = cache._expire_info[cache.make_key("key")]
+        time.sleep(0.01)
+        self.assertEqual(cache.get_or_set("key", lambda: "other"), "value")
+        self.assertEqual(cache._expire_info[cache.make_key("key")], expiry)
 
     @retry()
     @limit_locmem_entries

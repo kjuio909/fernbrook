@@ -221,6 +221,16 @@ Minor features
   boolean evaluation via
   :meth:`~django.contrib.sessions.backends.base.SessionBase.__bool__`.
 
+Caching
+~~~~~~~
+
+* When concurrent calls to
+  :meth:`~django.core.cache.backends.base.BaseCache.get_or_set` (using the
+  same cache instance) miss the same key, the callable default is now
+  evaluated only once. The other callers wait for that generation to finish
+  and all receive the same stored value, or the same exception if the
+  default raises. Different keys (and versions) remain independent.
+
 CSP
 ~~~
 

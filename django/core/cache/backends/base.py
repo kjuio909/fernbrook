@@ -1,6 +1,7 @@
 "Base Cache class."
 
 import asyncio
+import threading
 import time
 import warnings
 
@@ -21,6 +22,38 @@ class CacheKeyWarning(RuntimeWarning):
 
 class InvalidCacheKey(ValueError):
     pass
+
+
+class _InFlightGeneration:
+    """
+    Coordination point for a single round of concurrent get_or_set() misses.
+
+    The leading thread runs the default generation and reports the outcome:
+    either the committed value or the exception raised by the default. Every
+    other thread coalescing on the same cache entry waits for the round to
+    finish and observes that very same outcome.
+    """
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.value = None
+        self.exception = None
+        # Number of threads currently waiting for the leading thread.
+        self.waiters = 0
+
+    def wait(self):
+        self.event.wait()
+        if self.exception is not None:
+            raise self.exception
+        return self.value
+
+    def finish(self, value):
+        self.value = value
+        self.event.set()
+
+    def fail(self, exc):
+        self.exception = exc
+        self.event.set()
 
 
 # Stub class to ensure not passing in a `timeout` argument results in
@@ -88,6 +121,11 @@ class BaseCache:
         # constructed cache key so that versions (and custom key functions)
         # are treated as distinct cache entries.
         self._aget_or_set_in_flight = {}
+        # In-flight get_or_set() default generations, likewise keyed by the
+        # fully constructed cache key. Each entry is an _InFlightGeneration
+        # shared by all threads coalescing on the same cache entry.
+        self._get_or_set_in_flight = {}
+        self._get_or_set_lock = threading.Lock()
 
     def get_backend_timeout(self, timeout=DEFAULT_TIMEOUT):
         """
@@ -233,15 +271,53 @@ class BaseCache:
 
         Return the value of the key stored or retrieved.
         """
+        made_key = self.make_key(key, version=version)
+        # Coalesce concurrent misses for the same cache entry: only the first
+        # thread generates the default, every other concurrent thread waits
+        # for (and receives) the very same result or failure. Different keys
+        # (including different versions) have separate in-flight generations
+        # and never block each other. The lock guards the registry only; it
+        # is never held while the default runs.
+        with self._get_or_set_lock:
+            in_flight = self._get_or_set_in_flight.get(made_key)
+            if in_flight is None:
+                in_flight = _InFlightGeneration()
+                self._get_or_set_in_flight[made_key] = in_flight
+                leader = True
+            else:
+                in_flight.waiters += 1
+                leader = False
+        if not leader:
+            try:
+                return in_flight.wait()
+            finally:
+                with self._get_or_set_lock:
+                    in_flight.waiters -= 1
+        try:
+            result = self._get_or_set_generate(key, default, timeout, version)
+        except BaseException as exc:
+            in_flight.fail(exc)
+            raise
+        else:
+            in_flight.finish(result)
+            return result
+        finally:
+            with self._get_or_set_lock:
+                self._get_or_set_in_flight.pop(made_key, None)
+
+    def _get_or_set_generate(self, key, default, timeout, version):
         val = self.get(key, self._missing_key, version=version)
-        if val is self._missing_key:
-            if callable(default):
-                default = default()
-            self.add(key, default, timeout=timeout, version=version)
-            # Fetch the value again to avoid a race condition if another caller
-            # added a value between the first get() and the add() above.
-            return self.get(key, default, version=version)
-        return val
+        if val is not self._missing_key:
+            # The entry was populated before this generation started; return
+            # it without resetting its expiry.
+            return val
+        if callable(default):
+            default = default()
+        self.add(key, default, timeout=timeout, version=version)
+        # Fetch the value again to avoid a race condition if another writer
+        # added a value between the first get() and the add() above: the value
+        # already in the cache wins and must not be overwritten.
+        return self.get(key, default, version=version)
 
     async def aget_or_set(self, key, default, timeout=DEFAULT_TIMEOUT, version=None):
         """See get_or_set()."""
