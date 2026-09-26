@@ -1168,6 +1168,303 @@ class BaseCacheTests:
             cache_add.return_value = False
             self.assertEqual(cache.get_or_set("key", "default"), "default")
 
+    def _run_threads(self, *targets):
+        threads = [threading.Thread(target=target) for target in targets]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    def test_get_or_set_concurrent_miss_single_generation(self):
+        """Concurrent misses generate the default only once."""
+        # The cache proxy resolves to a per-thread instance; bind one
+        # instance so all threads exercise the same cache.
+        cache = caches["default"]
+        calls = 0
+        calls_lock = threading.Lock()
+        started = threading.Event()
+        gate = threading.Event()
+        results = []
+
+        def default():
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            started.set()
+            gate.wait()
+            return "value"
+
+        def worker():
+            results.append(cache.get_or_set("key", default))
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for thread in threads:
+            thread.start()
+        try:
+            self.assertTrue(started.wait(timeout=5))
+            time.sleep(0.01)  # Let all callers reach the miss.
+        finally:
+            gate.set()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(calls, 1)
+        self.assertEqual(results, ["value"] * 5)
+        self.assertEqual(cache.get("key"), "value")
+
+    def test_get_or_set_concurrent_plain_defaults(self):
+        """Concurrent plain defaults resolve to a single cached winner."""
+        # The cache proxy resolves to a per-thread instance; bind one
+        # instance so all threads exercise the same cache.
+        cache = caches["default"]
+        barrier = threading.Barrier(5)
+        results = []
+        results_lock = threading.Lock()
+
+        def worker(value):
+            barrier.wait(timeout=5)
+            with results_lock:
+                results.append(cache.get_or_set("key", value))
+
+        self._run_threads(*[lambda i=i: worker(i) for i in range(5)])
+        self.assertEqual(len(set(results)), 1)
+        self.assertEqual(cache.get("key"), results[0])
+
+    def test_get_or_set_concurrent_waiter_default_ignored(self):
+        """Waiters receive the in-flight result, not their own default."""
+        # The cache proxy resolves to a per-thread instance; bind one
+        # instance so all threads exercise the same cache.
+        cache = caches["default"]
+        started = threading.Event()
+        gate = threading.Event()
+        results = {}
+
+        def slow_default():
+            started.set()
+            gate.wait()
+            return "leader"
+
+        def leader():
+            results["leader"] = cache.get_or_set("key", slow_default)
+
+        def waiter():
+            results["waiter"] = cache.get_or_set("key", "waiter")
+
+        leader_thread = threading.Thread(target=leader)
+        leader_thread.start()
+        waiter_thread = threading.Thread(target=waiter)
+        try:
+            self.assertTrue(started.wait(timeout=5))
+            waiter_thread.start()
+            time.sleep(0.01)  # Let the waiter join the in-flight generation.
+        finally:
+            gate.set()
+        leader_thread.join()
+        waiter_thread.join()
+        self.assertEqual(results, {"leader": "leader", "waiter": "leader"})
+
+    def test_get_or_set_concurrent_different_keys(self):
+        """Misses for different keys don't block each other."""
+        # The cache proxy resolves to a per-thread instance; bind one
+        # instance so all threads exercise the same cache.
+        cache = caches["default"]
+        started = threading.Event()
+        gate = threading.Event()
+        results = {}
+
+        def slow_default():
+            started.set()
+            gate.wait()
+            return "slow"
+
+        def slow_worker():
+            results["slow"] = cache.get_or_set("slow_key", slow_default)
+
+        slow_thread = threading.Thread(target=slow_worker)
+        slow_thread.start()
+        try:
+            self.assertTrue(started.wait(timeout=5))
+            # A different key resolves without waiting for slow_key's
+            # generation.
+            self.assertEqual(cache.get_or_set("fast_key", "fast"), "fast")
+        finally:
+            gate.set()
+        slow_thread.join()
+        self.assertEqual(results["slow"], "slow")
+
+    def test_get_or_set_concurrent_versions(self):
+        """The same key with different versions is generated independently."""
+        # The cache proxy resolves to a per-thread instance; bind one
+        # instance so all threads exercise the same cache.
+        cache = caches["default"]
+        barrier = threading.Barrier(3)
+        gates = {1: threading.Event(), 2: threading.Event()}
+        calls = []
+        results = {}
+
+        def make_default(version):
+            def default():
+                calls.append(version)
+                gates[version].wait()
+                return "value-%s" % version
+
+            return default
+
+        def worker(version):
+            barrier.wait(timeout=5)
+            results[version] = cache.get_or_set(
+                "key", make_default(version), version=version
+            )
+
+        threads = [threading.Thread(target=worker, args=(v,)) for v in (1, 2)]
+        for thread in threads:
+            thread.start()
+        try:
+            barrier.wait(timeout=5)
+            for _ in range(100):  # Let both generations start.
+                if len(calls) == 2:
+                    break
+                time.sleep(0.01)
+            # Both generations are in flight at once; stagger the writes so
+            # backends that silently drop conflicting concurrent writes (e.g.
+            # the database backend on SQLite) still store both entries.
+            gates[1].set()
+            time.sleep(0.05)
+        finally:
+            gates[1].set()
+            gates[2].set()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(results, {1: "value-1", 2: "value-2"})
+        self.assertEqual(sorted(calls), [1, 2])
+        self.assertEqual(cache.get("key", version=1), "value-1")
+        self.assertEqual(cache.get("key", version=2), "value-2")
+
+    def test_get_or_set_concurrent_miss_shared_failure(self):
+        """
+        A failing default propagates the same failure to every waiter, leaves
+        no cache entry, and a later call may retry.
+        """
+        # The cache proxy resolves to a per-thread instance; bind one
+        # instance so all threads exercise the same cache.
+        cache = caches["default"]
+        calls = 0
+        calls_lock = threading.Lock()
+        started = threading.Event()
+        gate = threading.Event()
+        results = []
+
+        def default():
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            started.set()
+            gate.wait()
+            raise ValueError("boom")
+
+        def worker():
+            try:
+                cache.get_or_set("key", default)
+            except ValueError as exc:
+                results.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for thread in threads:
+            thread.start()
+        try:
+            self.assertTrue(started.wait(timeout=5))
+            time.sleep(0.01)  # Let all callers reach the miss.
+        finally:
+            gate.set()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(calls, 1)
+        self.assertEqual(len(results), 5)
+        for result in results:
+            self.assertIs(result, results[0])
+            self.assertEqual(str(result), "boom")
+        self.assertIsNone(cache.get("key"))
+        # A later call recomputes.
+        self.assertEqual(cache.get_or_set("key", "recovered"), "recovered")
+        self.assertEqual(cache.get("key"), "recovered")
+
+    def test_get_or_set_existing_value_no_generation(self):
+        """An existing value is returned without calling the default."""
+        # The cache proxy resolves to a per-thread instance; bind one
+        # instance so all threads exercise the same cache.
+        cache = caches["default"]
+        cache.set("key", "value")
+        called = False
+
+        def default():
+            nonlocal called
+            called = True
+            return "other"
+
+        results = []
+
+        def worker():
+            results.append(cache.get_or_set("key", default))
+
+        self._run_threads(*([worker] * 3))
+        self.assertEqual(results, ["value"] * 3)
+        self.assertIs(called, False)
+
+    def test_get_or_set_external_writer_wins(self):
+        """A value written during generation isn't overwritten."""
+
+        def default():
+            cache.set("key", "winner")
+            return "generated"
+
+        self.assertEqual(cache.get_or_set("key", default), "winner")
+        self.assertEqual(cache.get("key"), "winner")
+
+    def test_get_or_set_recomputes_after_delete(self):
+        """Once the entry is gone, a later call enters the miss flow again."""
+        self.assertEqual(cache.get_or_set("key", "one"), "one")
+        cache.delete("key")
+        self.assertEqual(cache.get_or_set("key", "two"), "two")
+
+    def test_get_or_set_timeout_zero_not_cached(self):
+        """A zero timeout returns the value without retaining the entry."""
+        self.assertEqual(cache.get_or_set("key", "value", timeout=0), "value")
+        self.assertIsNone(cache.get("key"))
+
+    def test_get_or_set_waiter_timeout_ignored(self):
+        """A waiter's own timeout doesn't change the in-flight write."""
+        # The cache proxy resolves to a per-thread instance; bind one
+        # instance so all threads exercise the same cache.
+        cache = caches["default"]
+        started = threading.Event()
+        gate = threading.Event()
+        results = {}
+
+        def slow_default():
+            started.set()
+            gate.wait()
+            return "leader"
+
+        def leader():
+            results["leader"] = cache.get_or_set("key", slow_default, timeout=None)
+
+        def waiter():
+            results["waiter"] = cache.get_or_set("key", "waiter", timeout=0)
+
+        leader_thread = threading.Thread(target=leader)
+        leader_thread.start()
+        waiter_thread = threading.Thread(target=waiter)
+        try:
+            self.assertTrue(started.wait(timeout=5))
+            waiter_thread.start()
+            time.sleep(0.01)  # Let the waiter join the in-flight generation.
+        finally:
+            gate.set()
+        leader_thread.join()
+        waiter_thread.join()
+        self.assertEqual(results, {"leader": "leader", "waiter": "leader"})
+        # The leader's non-expiring write wins over the waiter's timeout=0.
+        self.assertEqual(cache.get("key"), "leader")
+
     async def test_aget_or_set_concurrent_miss_single_generation(self):
         """Concurrent misses generate the default only once."""
         calls = 0

@@ -1,6 +1,7 @@
 "Base Cache class."
 
 import asyncio
+import threading
 import time
 import warnings
 
@@ -29,6 +30,29 @@ DEFAULT_TIMEOUT = object()
 
 # Memcached does not accept keys longer than this.
 MEMCACHE_MAX_KEY_LENGTH = 250
+
+
+class _GetOrSetInFlight:
+    """
+    Synchronization point for one in-flight get_or_set() generation.
+
+    The thread that creates the instance (the leader) runs the generation
+    and publishes the outcome; every other concurrent caller for the same
+    cache entry waits on the event and then shares that exact outcome.
+    """
+
+    __slots__ = ("event", "result", "exception")
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.result = None
+        self.exception = None
+
+    def wait_result(self):
+        self.event.wait()
+        if self.exception is not None:
+            raise self.exception
+        return self.result
 
 
 def default_key_func(key, key_prefix, version):
@@ -88,6 +112,10 @@ class BaseCache:
         # constructed cache key so that versions (and custom key functions)
         # are treated as distinct cache entries.
         self._aget_or_set_in_flight = {}
+        # Same for synchronous get_or_set(), guarded by a lock since
+        # concurrent callers may run on different threads.
+        self._get_or_set_lock = threading.Lock()
+        self._get_or_set_in_flight = {}
 
     def get_backend_timeout(self, timeout=DEFAULT_TIMEOUT):
         """
@@ -234,14 +262,58 @@ class BaseCache:
         Return the value of the key stored or retrieved.
         """
         val = self.get(key, self._missing_key, version=version)
-        if val is self._missing_key:
-            if callable(default):
-                default = default()
-            self.add(key, default, timeout=timeout, version=version)
-            # Fetch the value again to avoid a race condition if another caller
-            # added a value between the first get() and the add() above.
-            return self.get(key, default, version=version)
-        return val
+        if val is not self._missing_key:
+            return val
+        made_key = self.make_key(key, version=version)
+        # Coalesce concurrent misses for the same cache entry: only the first
+        # caller (the leader) generates the default, every other concurrent
+        # caller waits for (and receives) the very same result or failure.
+        # Different keys (including different versions) have separate
+        # in-flight entries and never block each other.
+        with self._get_or_set_lock:
+            in_flight = self._get_or_set_in_flight.get(made_key)
+            if in_flight is None:
+                in_flight = _GetOrSetInFlight()
+                self._get_or_set_in_flight[made_key] = in_flight
+                leader = True
+            else:
+                leader = False
+        if not leader:
+            # A generation is already in flight for this entry; its outcome
+            # (value or exception) is shared, and this caller's own default
+            # and timeout don't affect it.
+            return in_flight.wait_result()
+        try:
+            result = self._get_or_set_generate(key, default, timeout, version)
+        except BaseException as exc:
+            in_flight.exception = exc
+            raise
+        else:
+            in_flight.result = result
+            return result
+        finally:
+            # Publish the outcome before unregistering the round: a caller
+            # that arrives while this round is still registered joins it and
+            # shares its exact outcome, and only a caller arriving after the
+            # removal starts a fresh generation. This ordering guarantees a
+            # concurrent miss never triggers a second generation.
+            in_flight.event.set()
+            with self._get_or_set_lock:
+                self._get_or_set_in_flight.pop(made_key, None)
+
+    def _get_or_set_generate(self, key, default, timeout, version):
+        val = self.get(key, self._missing_key, version=version)
+        if val is not self._missing_key:
+            # The entry was populated before this generation started; return
+            # it without resetting its expiry.
+            return val
+        if callable(default):
+            default = default()
+        self.add(key, default, timeout=timeout, version=version)
+        # Fetch the value again to avoid a race condition if another writer
+        # added a value between the first get() and the add() above: the
+        # value already in the cache wins and must not be overwritten.
+        return self.get(key, default, version=version)
 
     async def aget_or_set(self, key, default, timeout=DEFAULT_TIMEOUT, version=None):
         """See get_or_set()."""
