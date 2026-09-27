@@ -1642,6 +1642,42 @@ class BaseCacheTests:
         self.assertEqual(await cache.aget_or_set("key", "recovered"), "recovered")
         self.assertEqual(await cache.aget("key"), "recovered")
 
+    async def test_aget_or_set_concurrent_miss_failure_preserves_external_value(self):
+        """
+        A failing default doesn't remove a value written by someone else
+        during the generation; waiters get the failure, later calls the
+        external value.
+        """
+
+        class GenerationError(Exception):
+            pass
+
+        error = GenerationError("boom")
+        gate = asyncio.Event()
+
+        async def default():
+            await gate.wait()
+            # Simulate an external value landing in the cache during the
+            # generation; the subsequent failure must not delete it.
+            await cache.aset("key", "external")
+            raise error
+
+        tasks = [
+            asyncio.create_task(cache.aget_or_set("key", default)) for _ in range(5)
+        ]
+        await asyncio.sleep(0.01)  # Let all callers reach the miss.
+        gate.set()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            self.assertIs(result, error)
+        self.assertEqual(await cache.aget("key"), "external")
+        # A later call observes the existing value without regenerating.
+        self.assertEqual(await cache.aget_or_set("key", default), "external")
+        # Once the entry is gone, generation may be retried.
+        await cache.adelete("key")
+        self.assertEqual(await cache.aget_or_set("key", "recovered"), "recovered")
+        self.assertEqual(await cache.aget("key"), "recovered")
+
     async def test_aget_or_set_existing_value_no_generation(self):
         """An existing value is returned without calling the default."""
         await cache.aset("key", "value")
@@ -1869,15 +1905,13 @@ class BaseCacheTests:
             cache._aget_or_set_generate("key", failing_default, DEFAULT_TIMEOUT, None)
         )
         cache._aget_or_set_in_flight[cache.make_key("key")] = in_flight
-        await asyncio.sleep(0.01)  # Let the generation task fail.
+        with self.assertRaises(ValueError):
+            await in_flight.task
         self.assertTrue(in_flight.task.done())
-        try:
-            # The finished round is retired, not joined: the miss is
-            # re-determined and a fresh value generated.
-            self.assertEqual(await cache.aget_or_set("key", "fresh"), "fresh")
-            self.assertEqual(await cache.aget("key"), "fresh")
-        finally:
-            in_flight.task.exception()  # Retire the unused stale outcome.
+        # The finished round is retired, not joined: the miss is
+        # re-determined and a fresh value generated.
+        self.assertEqual(await cache.aget_or_set("key", "fresh"), "fresh")
+        self.assertEqual(await cache.aget("key"), "fresh")
 
     async def test_aget_or_set_finished_successful_round_not_joined(self):
         """A new call after a finished round re-reads the committed value."""
@@ -1892,7 +1926,7 @@ class BaseCacheTests:
             cache._aget_or_set_generate("key", default, DEFAULT_TIMEOUT, None)
         )
         cache._aget_or_set_in_flight[cache.make_key("key")] = in_flight
-        await asyncio.sleep(0.01)  # Let the generation task commit.
+        self.assertEqual(await in_flight.task, "value")
         self.assertTrue(in_flight.task.done())
         # The committed value is observed without running the default again.
         self.assertEqual(await cache.aget_or_set("key", default), "value")

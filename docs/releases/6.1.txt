@@ -230,6 +230,13 @@ Caching
   evaluated only once. The other callers wait for that generation to finish
   and all receive the same stored value, or the same exception if the
   default raises. Different keys (and versions) remain independent.
+  :meth:`~django.core.cache.backends.base.BaseCache.aget_or_set` makes the
+  same guarantees for asynchronous callers: one generation per round, the
+  same value or exception for every participant, and independent rounds for
+  different keys and versions. Cancelling a caller only cancels that
+  caller; the shared generation runs to completion while other participants
+  remain, and a value written directly to the cache during the generation
+  is never overwritten.
 
 CSP
 ~~~
