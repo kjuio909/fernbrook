@@ -23,6 +23,7 @@ class DummyCache(BaseCache):
         return False
 
     def delete(self, key, version=None):
+        self._retire_aget_or_set_in_flight(key, version)
         self.make_and_validate_key(key, version=version)
         return False
 

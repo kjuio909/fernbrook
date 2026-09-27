@@ -438,6 +438,25 @@ class BaseCache:
             result = await result
         return result
 
+    def _retire_aget_or_set_in_flight(self, key, version=None):
+        """
+        Retire any in-flight aget_or_set() generation round for the key.
+
+        Deleting the entry invalidates the round that was generating its
+        value: a later miss must confirm the state of the cache entry from
+        scratch instead of joining a round whose outcome predates the
+        deletion. Only the round registered right now is retired; a round
+        started after the deletion is untouched. The detached round keeps
+        running for its remaining participants, who still share its
+        outcome, but its late result can no longer be observed by new
+        callers, and its commit (an add()) can't overwrite a value written
+        after this point.
+        """
+        made_key = self.make_key(key, version=version)
+        in_flight = self._aget_or_set_in_flight.pop(made_key, None)
+        if in_flight is not None and in_flight.task.done():
+            _discard_generation_result(in_flight.task)
+
     def has_key(self, key, version=None):
         """
         Return True if the key is in the cache and has not expired.

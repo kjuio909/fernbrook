@@ -87,6 +87,7 @@ class BaseMemcachedCache(BaseCache):
         return bool(self._cache.touch(key, self.get_backend_timeout(timeout)))
 
     def delete(self, key, version=None):
+        self._retire_aget_or_set_in_flight(key, version)
         key = self.make_and_validate_key(key, version=version)
         return bool(self._cache.delete(key))
 
@@ -131,6 +132,8 @@ class BaseMemcachedCache(BaseCache):
         return [original_keys[k] for k in failed_keys]
 
     def delete_many(self, keys, version=None):
+        for key in keys:
+            self._retire_aget_or_set_in_flight(key, version)
         keys = [self.make_and_validate_key(key, version=version) for key in keys]
         self._cache.delete_multi(keys)
 

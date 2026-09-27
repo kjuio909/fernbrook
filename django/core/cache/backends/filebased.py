@@ -78,6 +78,7 @@ class FileBasedCache(BaseCache):
             return False
 
     def delete(self, key, version=None):
+        self._retire_aget_or_set_in_flight(key, version)
         return self._delete(self._key_to_file(key, version))
 
     def _delete(self, fname):

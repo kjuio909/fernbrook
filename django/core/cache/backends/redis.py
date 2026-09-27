@@ -209,6 +209,7 @@ class RedisCache(BaseCache):
         return self._cache.touch(key, self.get_backend_timeout(timeout))
 
     def delete(self, key, version=None):
+        self._retire_aget_or_set_in_flight(key, version)
         key = self.make_and_validate_key(key, version=version)
         return self._cache.delete(key)
 
@@ -240,6 +241,8 @@ class RedisCache(BaseCache):
     def delete_many(self, keys, version=None):
         if not keys:
             return
+        for key in keys:
+            self._retire_aget_or_set_in_flight(key, version)
         safe_keys = [self.make_and_validate_key(key, version=version) for key in keys]
         self._cache.delete_many(safe_keys)
 

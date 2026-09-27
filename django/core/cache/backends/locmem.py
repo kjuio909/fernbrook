@@ -108,6 +108,7 @@ class LocMemCache(BaseCache):
         return True
 
     def delete(self, key, version=None):
+        self._retire_aget_or_set_in_flight(key, version)
         key = self.make_and_validate_key(key, version=version)
         with self._lock:
             return self._delete(key)

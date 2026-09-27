@@ -16,6 +16,7 @@ from pathlib import Path
 from unittest import mock, skipIf
 
 import django
+from asgiref.sync import sync_to_async
 from django.conf import settings
 from django.core import management, signals
 from django.core.cache import (
@@ -1706,6 +1707,81 @@ class BaseCacheTests:
         self.assertEqual(await cache.aget_or_set("key", "one"), "one")
         await cache.adelete("key")
         self.assertEqual(await cache.aget_or_set("key", "two"), "two")
+
+    async def test_aget_or_set_delete_during_generation_starts_new_round(self):
+        """Deleting the key retires a paused round instead of joining it."""
+        gate = asyncio.Event()
+
+        async def slow_default():
+            await gate.wait()
+            return "old"
+
+        retired = asyncio.create_task(cache.aget_or_set("key", slow_default))
+        await self._wait_for_aget_or_set_participants(cache, "key", 1)
+        await cache.adelete("key")
+        # The new request must not wait for or reuse the retired round: it
+        # confirms the miss and completes with its own default.
+        self.assertEqual(await cache.aget_or_set("key", "new"), "new")
+        # The retired round's late success can't overwrite the new state;
+        # its participant observes the committed value.
+        gate.set()
+        self.assertEqual(await retired, "new")
+        self.assertEqual(await cache.aget("key"), "new")
+
+    async def test_aget_or_set_sync_delete_during_generation(self):
+        """A synchronous delete also retires an in-flight async round."""
+        gate = asyncio.Event()
+
+        async def slow_default():
+            await gate.wait()
+            return "old"
+
+        retired = asyncio.create_task(cache.aget_or_set("key", slow_default))
+        await self._wait_for_aget_or_set_participants(cache, "key", 1)
+        # Call the synchronous delete() itself (in a thread where a backend
+        # may require synchronous context), not adelete().
+        await sync_to_async(cache.delete)("key")
+        self.assertEqual(await cache.aget_or_set("key", "new"), "new")
+        gate.set()
+        self.assertEqual(await retired, "new")
+        self.assertEqual(await cache.aget("key"), "new")
+
+    async def test_aget_or_set_delete_retired_round_failure_not_propagated(self):
+        """A retired round's failure reaches only its own participants."""
+        gate = asyncio.Event()
+
+        async def failing_default():
+            await gate.wait()
+            raise ValueError("boom")
+
+        retired = asyncio.create_task(cache.aget_or_set("key", failing_default))
+        await self._wait_for_aget_or_set_participants(cache, "key", 1)
+        await cache.adelete("key")
+        self.assertEqual(await cache.aget_or_set("key", "new"), "new")
+        gate.set()
+        with self.assertRaises(ValueError):
+            await retired
+        # The new state is untouched and later calls see no trace of the
+        # retired round's failure.
+        self.assertEqual(await cache.aget("key"), "new")
+        self.assertEqual(await cache.aget_or_set("key", "other"), "new")
+
+    async def test_aget_or_set_delete_other_version_keeps_round(self):
+        """Deleting another version doesn't retire the key's round."""
+        gate = asyncio.Event()
+
+        async def slow_default():
+            await gate.wait()
+            return "generated"
+
+        leader = asyncio.create_task(cache.aget_or_set("key", slow_default))
+        await self._wait_for_aget_or_set_participants(cache, "key", 1)
+        await cache.adelete("key", version=2)
+        waiter = asyncio.create_task(cache.aget_or_set("key", "waiter"))
+        await self._wait_for_aget_or_set_participants(cache, "key", 2)
+        gate.set()
+        # The waiter joined the still-registered round.
+        self.assertEqual(await asyncio.gather(leader, waiter), ["generated"] * 2)
 
     async def test_aget_or_set_zero_timeout(self):
         """An explicit zero timeout returns the value without storing it."""

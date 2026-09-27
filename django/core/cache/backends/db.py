@@ -205,10 +205,13 @@ class DatabaseCache(BaseDatabaseCache):
                 return True
 
     def delete(self, key, version=None):
+        self._retire_aget_or_set_in_flight(key, version)
         key = self.make_and_validate_key(key, version=version)
         return self._base_delete_many([key])
 
     def delete_many(self, keys, version=None):
+        for key in keys:
+            self._retire_aget_or_set_in_flight(key, version)
         keys = [self.make_and_validate_key(key, version=version) for key in keys]
         self._base_delete_many(keys)
 
