@@ -1217,6 +1217,38 @@ class BaseCacheTests:
             time.sleep(0.005)
         self.fail("Timed out waiting for %s in-flight waiters." % count)
 
+    async def _wait_for_generation_task(self, task, timeout=5):
+        """Wait for a generation task to reach its outcome."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while not task.done():
+            if loop.time() >= deadline:
+                self.fail("Generation task did not finish within %s seconds." % timeout)
+            # Some backends run the generation through the thread-sensitive
+            # executor, whose hops can take longer than a fixed sleep under
+            # load; yield control instead of racing the scheduler.
+            await asyncio.sleep(0.005)
+
+    async def _wait_for_aget_or_set_participants(
+        self, concrete_cache, key, count, version=None, timeout=5
+    ):
+        """Wait until *count* callers joined the key's in-flight generation."""
+        made_key = concrete_cache.make_key(key, version=version)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            in_flight = concrete_cache._aget_or_set_in_flight.get(made_key)
+            if in_flight is not None and in_flight.participants >= count:
+                return
+            if loop.time() >= deadline:
+                self.fail(
+                    "Timed out waiting for %s in-flight participants." % count
+                )
+            # Yield control so pending callers can reach and join the round;
+            # a fixed sleep can be shorter than a thread-sensitive executor
+            # hop on some backends under load.
+            await asyncio.sleep(0.005)
+
     def test_get_or_set_concurrent_miss_single_generation(self):
         """Concurrent misses generate the callable default only once."""
         concrete_cache = caches["default"]
@@ -1535,7 +1567,7 @@ class BaseCacheTests:
         tasks = [
             asyncio.create_task(cache.aget_or_set("key", default)) for _ in range(5)
         ]
-        await asyncio.sleep(0.01)  # Let all callers reach the miss.
+        await self._wait_for_aget_or_set_participants(cache, "key", 5)
         gate.set()
         results = await asyncio.gather(*tasks)
         self.assertEqual(calls, 1)
@@ -1566,9 +1598,9 @@ class BaseCacheTests:
             return "leader"
 
         leader = asyncio.create_task(cache.aget_or_set("key", slow_default))
-        await asyncio.sleep(0.01)  # Let the leader register its generation.
+        await self._wait_for_aget_or_set_participants(cache, "key", 1)
         waiter = asyncio.create_task(cache.aget_or_set("key", "waiter"))
-        await asyncio.sleep(0.01)
+        await self._wait_for_aget_or_set_participants(cache, "key", 2)
         gate.set()
         self.assertEqual(await leader, "leader")
         self.assertEqual(await waiter, "leader")
@@ -1582,7 +1614,7 @@ class BaseCacheTests:
             return "slow"
 
         slow_task = asyncio.create_task(cache.aget_or_set("slow_key", slow_default))
-        await asyncio.sleep(0.01)  # Let the slow generation start.
+        await self._wait_for_aget_or_set_participants(cache, "slow_key", 1)
         # A different key resolves without waiting for slow_key's generation.
         self.assertEqual(await cache.aget_or_set("fast_key", "fast"), "fast")
         gate.set()
@@ -1605,7 +1637,8 @@ class BaseCacheTests:
             asyncio.create_task(cache.aget_or_set("key", make_default(v), version=v))
             for v in (1, 2)
         ]
-        await asyncio.sleep(0.01)  # Let both generations start.
+        for v in (1, 2):
+            await self._wait_for_aget_or_set_participants(cache, "key", 1, version=v)
         gate.set()
         results = await asyncio.gather(*tasks)
         self.assertEqual(results, ["value-1", "value-2"])
@@ -1630,7 +1663,7 @@ class BaseCacheTests:
         tasks = [
             asyncio.create_task(cache.aget_or_set("key", default)) for _ in range(5)
         ]
-        await asyncio.sleep(0.01)  # Let all callers reach the miss.
+        await self._wait_for_aget_or_set_participants(cache, "key", 5)
         gate.set()
         results = await asyncio.gather(*tasks, return_exceptions=True)
         self.assertEqual(calls, 1)
@@ -1694,7 +1727,7 @@ class BaseCacheTests:
             asyncio.create_task(cache.aget_or_set("key", slow_default))
             for _ in range(4)
         ]
-        await asyncio.sleep(0.01)  # Let every caller reach the miss.
+        await self._wait_for_aget_or_set_participants(cache, "key", 4)
         gate.set()
         self.assertEqual(await asyncio.gather(*tasks), ["winner"] * 4)
         self.assertEqual(await cache.aget("key"), "winner")
@@ -1708,11 +1741,11 @@ class BaseCacheTests:
             return "value"
 
         leader = asyncio.create_task(cache.aget_or_set("key", slow_default, None))
-        await asyncio.sleep(0.01)  # Let the leader register its generation.
+        await self._wait_for_aget_or_set_participants(cache, "key", 1)
         # A zero timeout means "don't store"; it must not win over the
         # leader's explicit permanent timeout.
         waiter = asyncio.create_task(cache.aget_or_set("key", "other", 0))
-        await asyncio.sleep(0.01)
+        await self._wait_for_aget_or_set_participants(cache, "key", 2)
         gate.set()
         self.assertEqual(await leader, "value")
         self.assertEqual(await waiter, "value")
@@ -1727,7 +1760,7 @@ class BaseCacheTests:
             return "secret"
 
         task = asyncio.create_task(cache.aget_or_set("key", slow_default))
-        await asyncio.sleep(0.01)  # Let the generation start.
+        await self._wait_for_aget_or_set_participants(cache, "key", 1)
         self.assertIsNone(await cache.aget("key"))
         gate.set()
         self.assertEqual(await task, "secret")
@@ -1745,10 +1778,10 @@ class BaseCacheTests:
             return "value"
 
         leader = asyncio.create_task(cache.aget_or_set("key", default))
-        await asyncio.sleep(0.01)  # Let the generation start.
+        await self._wait_for_aget_or_set_participants(cache, "key", 1)
         cancelled_waiter = asyncio.create_task(cache.aget_or_set("key", "other"))
         waiter = asyncio.create_task(cache.aget_or_set("key", "other"))
-        await asyncio.sleep(0.01)
+        await self._wait_for_aget_or_set_participants(cache, "key", 3)
         cancelled_waiter.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await cancelled_waiter
@@ -1770,15 +1803,15 @@ class BaseCacheTests:
             return "value"
 
         leader = asyncio.create_task(cache.aget_or_set("key", default))
-        await asyncio.sleep(0.01)  # Let the generation start.
+        await self._wait_for_aget_or_set_participants(cache, "key", 1)
         waiter = asyncio.create_task(cache.aget_or_set("key", "other"))
-        await asyncio.sleep(0.01)
+        await self._wait_for_aget_or_set_participants(cache, "key", 2)
         leader.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await leader
         # The round is still live: another caller joins it, doesn't restart.
         late = asyncio.create_task(cache.aget_or_set("key", "late"))
-        await asyncio.sleep(0.01)
+        await self._wait_for_aget_or_set_participants(cache, "key", 2)
         gate.set()
         self.assertEqual(await waiter, "value")
         self.assertEqual(await late, "value")
@@ -1788,25 +1821,30 @@ class BaseCacheTests:
     async def test_aget_or_set_cancel_all_abandons_round(self):
         """Cancelling every participant abandons the round cleanly."""
         calls = 0
+        started = asyncio.Event()
         gate = asyncio.Event()
 
         async def default():
             nonlocal calls
             calls += 1
+            started.set()
             await gate.wait()
             return "value"
 
         task = asyncio.create_task(cache.aget_or_set("key", default))
-        await asyncio.sleep(0.01)  # Let the generation start.
+        await started.wait()  # Let the generation enter the default.
+        generation_task = cache._aget_or_set_in_flight[
+            cache.make_key("key")
+        ].task
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
         # The round is detached: no half-finished state is left behind.
         self.assertEqual(cache._aget_or_set_in_flight, {})
+        # Let the abandoned generation finish unwinding.
+        await asyncio.gather(generation_task, return_exceptions=True)
         self.assertIsNone(await cache.aget("key"))
-        # Let the abandoned generation unwind before starting the next one.
         gate.set()
-        await asyncio.sleep(0.01)
         # A later call generates from scratch.
         self.assertEqual(await cache.aget_or_set("key", "recovered"), "recovered")
         self.assertEqual(await cache.aget("key"), "recovered")
@@ -1821,13 +1859,17 @@ class BaseCacheTests:
             return "generated"
 
         task = asyncio.create_task(cache.aget_or_set("key", slow_default))
-        await asyncio.sleep(0.01)  # Let the generation start.
+        await self._wait_for_aget_or_set_participants(cache, "key", 1)
+        generation_task = cache._aget_or_set_in_flight[
+            cache.make_key("key")
+        ].task
         await cache.aset("key", "external")
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
         gate.set()
-        await asyncio.sleep(0.01)
+        # Let the abandoned generation finish unwinding.
+        await asyncio.gather(generation_task, return_exceptions=True)
         # The external value survives; a later call observes it directly
         # without regenerating.
         self.assertEqual(await cache.aget("key"), "external")
@@ -1842,12 +1884,12 @@ class BaseCacheTests:
             raise ValueError("boom")
 
         leader = asyncio.create_task(cache.aget_or_set("key", failing_default))
-        await asyncio.sleep(0.01)  # Let the generation start.
+        await self._wait_for_aget_or_set_participants(cache, "key", 1)
         cancelled_waiter = asyncio.create_task(
             cache.aget_or_set("key", failing_default)
         )
         waiter = asyncio.create_task(cache.aget_or_set("key", failing_default))
-        await asyncio.sleep(0.01)
+        await self._wait_for_aget_or_set_participants(cache, "key", 3)
         cancelled_waiter.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await cancelled_waiter
@@ -1869,7 +1911,7 @@ class BaseCacheTests:
             cache._aget_or_set_generate("key", failing_default, DEFAULT_TIMEOUT, None)
         )
         cache._aget_or_set_in_flight[cache.make_key("key")] = in_flight
-        await asyncio.sleep(0.01)  # Let the generation task fail.
+        await self._wait_for_generation_task(in_flight.task)
         self.assertTrue(in_flight.task.done())
         try:
             # The finished round is retired, not joined: the miss is
@@ -1892,7 +1934,7 @@ class BaseCacheTests:
             cache._aget_or_set_generate("key", default, DEFAULT_TIMEOUT, None)
         )
         cache._aget_or_set_in_flight[cache.make_key("key")] = in_flight
-        await asyncio.sleep(0.01)  # Let the generation task commit.
+        await self._wait_for_generation_task(in_flight.task)
         self.assertTrue(in_flight.task.done())
         # The committed value is observed without running the default again.
         self.assertEqual(await cache.aget_or_set("key", default), "value")

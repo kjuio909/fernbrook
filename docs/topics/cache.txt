@@ -1026,7 +1026,10 @@ instance, for a key that is missing, the callable default is executed only
 once. The other callers wait for that generation to finish and all of them
 receive the same stored value (or, if the default raises, the same
 exception). Generations for different keys (and different versions) stay
-independent and never block each other.
+independent and never block each other. ``aget_or_set()`` offers the same
+guarantees for concurrent coroutines: cancelling a single caller leaves a
+generation that still has participants intact, while cancelling all
+participants abandons the uncommitted generation without caching a value.
 
 .. method:: cache.get_many(keys, version=None)
 
