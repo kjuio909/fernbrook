@@ -2229,6 +2229,26 @@ class LocMemCacheTests(BaseCacheTests, TestCase):
         self.assertEqual(cache.get_or_set("key", lambda: "other"), "value")
         self.assertEqual(cache._expire_info[cache.make_key("key")], expiry)
 
+    async def test_aget_or_set_default_timeout(self):
+        """An omitted timeout stores the entry with the default timeout."""
+        await cache.aget_or_set("key", "value")
+        expiry = cache._expire_info[cache.make_key("key")]
+        self.assertIsNotNone(expiry)
+        self.assertAlmostEqual(expiry, time.time() + cache.default_timeout, delta=5)
+
+    async def test_aget_or_set_none_timeout(self):
+        """An explicit None timeout stores a non-expiring entry."""
+        await cache.aget_or_set("key", "value", timeout=None)
+        self.assertIsNone(cache._expire_info[cache.make_key("key")])
+
+    async def test_aget_or_set_existing_value_does_not_extend_expiry(self):
+        """Reading an existing entry doesn't reset its expiry."""
+        await cache.aset("key", "value", timeout=100)
+        expiry = cache._expire_info[cache.make_key("key")]
+        await asyncio.sleep(0.01)
+        self.assertEqual(await cache.aget_or_set("key", lambda: "other"), "value")
+        self.assertEqual(cache._expire_info[cache.make_key("key")], expiry)
+
     @retry()
     @limit_locmem_entries
     def test_lru_get(self):
