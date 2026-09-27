@@ -1869,7 +1869,9 @@ class BaseCacheTests:
             cache._aget_or_set_generate("key", failing_default, DEFAULT_TIMEOUT, None)
         )
         cache._aget_or_set_in_flight[cache.make_key("key")] = in_flight
-        await asyncio.sleep(0.01)  # Let the generation task fail.
+        # Wait for the generation task to fail.
+        with self.assertRaises(ValueError):
+            await asyncio.wait_for(asyncio.shield(in_flight.task), 1)
         self.assertTrue(in_flight.task.done())
         try:
             # The finished round is retired, not joined: the miss is
@@ -1892,7 +1894,8 @@ class BaseCacheTests:
             cache._aget_or_set_generate("key", default, DEFAULT_TIMEOUT, None)
         )
         cache._aget_or_set_in_flight[cache.make_key("key")] = in_flight
-        await asyncio.sleep(0.01)  # Let the generation task commit.
+        # Wait for the generation task to commit.
+        await asyncio.wait_for(asyncio.shield(in_flight.task), 1)
         self.assertTrue(in_flight.task.done())
         # The committed value is observed without running the default again.
         self.assertEqual(await cache.aget_or_set("key", default), "value")
