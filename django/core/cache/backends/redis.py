@@ -203,6 +203,10 @@ class RedisCache(BaseCache):
     def set(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
         key = self.make_and_validate_key(key, version=version)
         self._cache.set(key, value, self.get_backend_timeout(timeout))
+        # An unconditional write outlives any generation in flight: if it is
+        # later deleted or expires server-side, a later miss must not rejoin
+        # that round.
+        self._note_aget_or_set_repopulation(key)
 
     def touch(self, key, timeout=DEFAULT_TIMEOUT, version=None):
         key = self.make_and_validate_key(key, version=version)
@@ -235,6 +239,7 @@ class RedisCache(BaseCache):
         for key, value in data.items():
             key = self.make_and_validate_key(key, version=version)
             safe_data[key] = value
+            self._note_aget_or_set_repopulation(key)
         self._cache.set_many(safe_data, self.get_backend_timeout(timeout))
         return []
 
@@ -247,4 +252,5 @@ class RedisCache(BaseCache):
         self._cache.delete_many(safe_keys)
 
     def clear(self):
+        self._retire_all_aget_or_set_in_flight()
         return self._cache.clear()

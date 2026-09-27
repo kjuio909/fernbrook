@@ -81,6 +81,11 @@ class BaseMemcachedCache(BaseCache):
             # Make sure the key doesn't keep its old value in case of failure
             # to set (memcached's 1MB limit).
             self._cache.delete(key)
+        else:
+            # An unconditional write outlives any generation in flight: if it
+            # is later deleted or expires server-side, a later miss must not
+            # rejoin that round.
+            self._note_aget_or_set_repopulation(key)
 
     def touch(self, key, timeout=DEFAULT_TIMEOUT, version=None):
         key = self.make_and_validate_key(key, version=version)
@@ -129,6 +134,9 @@ class BaseMemcachedCache(BaseCache):
         failed_keys = self._cache.set_multi(
             safe_data, self.get_backend_timeout(timeout)
         )
+        for safe_key in safe_data:
+            if safe_key not in failed_keys:
+                self._note_aget_or_set_repopulation(safe_key)
         return [original_keys[k] for k in failed_keys]
 
     def delete_many(self, keys, version=None):
@@ -138,6 +146,7 @@ class BaseMemcachedCache(BaseCache):
         self._cache.delete_multi(keys)
 
     def clear(self):
+        self._retire_all_aget_or_set_in_flight()
         self._cache.flush_all()
 
     def validate_key(self, key):

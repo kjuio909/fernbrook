@@ -32,4 +32,4 @@ class DummyCache(BaseCache):
         return False
 
     def clear(self):
-        pass
+        self._retire_all_aget_or_set_in_flight()

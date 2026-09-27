@@ -25,9 +25,19 @@ class FileBasedCache(BaseCache):
         self._createdir()
 
     def add(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
-        if self.has_key(key, version):
-            return False
-        self.set(key, value, timeout, version)
+        made_key = self.make_and_validate_key(key, version=version)
+        fname = self._made_key_to_file(made_key)
+        try:
+            with open(fname, "rb") as f:
+                if not self._is_expired(f):
+                    return False
+        except FileNotFoundError:
+            pass
+        # Write directly: unlike set(), this is a miss-only commit (such as
+        # an aget_or_set() generation's own), so it mustn't mark the entry as
+        # repopulated while a round is in flight.
+        self._createdir()
+        self._set_file(fname, value, timeout)
         return True
 
     def get(self, key, default=None, version=None):
@@ -47,7 +57,13 @@ class FileBasedCache(BaseCache):
 
     def set(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
         self._createdir()  # Cache dir can be deleted at any time.
-        fname = self._key_to_file(key, version)
+        made_key = self.make_and_validate_key(key, version=version)
+        self._set_file(self._made_key_to_file(made_key), value, timeout)
+        # An unconditional write outlives any generation in flight: if it is
+        # later deleted or expires, a later miss must not rejoin that round.
+        self._note_aget_or_set_repopulation(made_key)
+
+    def _set_file(self, fname, value, timeout):
         self._cull()  # make some room if necessary
         fd, tmp_path = tempfile.mkstemp(dir=self._dir)
         renamed = False
@@ -127,12 +143,14 @@ class FileBasedCache(BaseCache):
         Convert a key into a cache file path. Basically this is the
         root cache path joined with the md5sum of the key and a suffix.
         """
-        key = self.make_and_validate_key(key, version=version)
+        return self._made_key_to_file(self.make_and_validate_key(key, version=version))
+
+    def _made_key_to_file(self, made_key):
         return os.path.join(
             self._dir,
             "".join(
                 [
-                    md5(key.encode(), usedforsecurity=False).hexdigest(),
+                    md5(made_key.encode(), usedforsecurity=False).hexdigest(),
                     self.cache_suffix,
                 ]
             ),
@@ -142,6 +160,7 @@ class FileBasedCache(BaseCache):
         """
         Remove all the cache files.
         """
+        self._retire_all_aget_or_set_in_flight()
         for fname in self._list_cache_files():
             self._delete(fname)
 

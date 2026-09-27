@@ -100,7 +100,11 @@ class DatabaseCache(BaseDatabaseCache):
 
     def set(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
         key = self.make_and_validate_key(key, version=version)
-        self._base_set("set", key, value, timeout)
+        if self._base_set("set", key, value, timeout):
+            # An unconditional write outlives any generation in flight: if it
+            # is later deleted or expires, a later miss must not rejoin that
+            # round.
+            self._note_aget_or_set_repopulation(key)
 
     def add(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
         key = self.make_and_validate_key(key, version=version)
@@ -291,6 +295,7 @@ class DatabaseCache(BaseDatabaseCache):
                     )
 
     def clear(self):
+        self._retire_all_aget_or_set_in_flight()
         db = router.db_for_write(self.cache_model_class)
         connection = connections[db]
         table = connection.ops.quote_name(self._table)

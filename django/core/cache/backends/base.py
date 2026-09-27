@@ -74,11 +74,18 @@ class _AsyncInFlightGeneration:
     task.
     """
 
-    __slots__ = ("task", "participants")
+    __slots__ = ("task", "participants", "repopulated")
 
     def __init__(self, coro):
         self.task = asyncio.ensure_future(coro)
         self.participants = 1
+        # True once a value is unconditionally stored for the entry while
+        # this round is in flight (via set()/set_many()). Such a value may
+        # vanish before a later miss request runs -- deleted, reaped as
+        # expired, or expired server-side -- and a read then misses even
+        # though this generation is still running. That later miss must
+        # start a fresh round instead of joining this one.
+        self.repopulated = False
 
     def join(self):
         self.participants += 1
@@ -384,8 +391,46 @@ class BaseCache:
             _discard_generation_result(in_flight.task)
             in_flight = None
         if in_flight is not None:
-            in_flight.join()
-        else:
+            if not in_flight.repopulated:
+                # No value was stored for the entry while this round is in
+                # flight (other than the generation's own add() commit, whose
+                # result the task itself re-reads), so the entry is either
+                # still missing or holds the generation's committed value.
+                # Coalesce onto the round without an extra read; an explicit
+                # delete would already have detached it above.
+                in_flight.join()
+            else:
+                # A value was stored unconditionally (set()/set_many()) while
+                # the round was running. Re-read the entry instead of joining
+                # blindly: the stored value is returned directly, and if it
+                # has since been deleted or expired this miss describes a
+                # newer state of the entry than the running generation.
+                val = await self.aget(key, self._missing_key, version=version)
+                current = self._aget_or_set_in_flight.get(made_key)
+                if current is in_flight:
+                    if val is not self._missing_key:
+                        return val
+                    # The repopulating value vanished -- it expired -- so
+                    # detach the old round (it keeps running for its existing
+                    # participants) and start a fresh one below.
+                    self._aget_or_set_in_flight.pop(made_key, None)
+                    if in_flight.task.done():
+                        _discard_generation_result(in_flight.task)
+                    in_flight = None
+                elif current is None:
+                    # The round was retired while the read was in flight (an
+                    # explicit delete or the round's last participant
+                    # unwound). A live value needs no generation; a miss
+                    # starts a fresh round from scratch.
+                    if val is not self._missing_key:
+                        return val
+                    in_flight = None
+                else:
+                    # A newer round already took over and re-determined the
+                    # state of the entry when it started; coalesce onto it.
+                    in_flight = current
+                    in_flight.join()
+        if in_flight is None:
             in_flight = _AsyncInFlightGeneration(
                 self._aget_or_set_generate(key, default, timeout, version)
             )
@@ -456,6 +501,35 @@ class BaseCache:
         in_flight = self._aget_or_set_in_flight.pop(made_key, None)
         if in_flight is not None and in_flight.task.done():
             _discard_generation_result(in_flight.task)
+
+    def _note_aget_or_set_repopulation(self, made_key):
+        """
+        Note that a value was unconditionally stored for the entry while a
+        generation round may be in flight (via set()/set_many()).
+
+        Such a value is independent of the generation's own add() commit. If
+        it has vanished by the time a later miss request reads the entry --
+        deleted, reaped as expired, or expired server-side -- that request
+        must start a fresh round instead of joining the still-running one.
+        """
+        in_flight = self._aget_or_set_in_flight.get(made_key)
+        if in_flight is not None:
+            in_flight.repopulated = True
+
+    def _retire_all_aget_or_set_in_flight(self):
+        """
+        Retire every in-flight aget_or_set() generation round.
+
+        Clearing the cache removes every entry at once, so no registered
+        round can still describe a live entry; new calls must re-determine
+        misses from scratch. Detached rounds keep running for their
+        remaining participants.
+        """
+        in_flights = list(self._aget_or_set_in_flight.values())
+        self._aget_or_set_in_flight.clear()
+        for in_flight in in_flights:
+            if in_flight.task.done():
+                _discard_generation_result(in_flight.task)
 
     def has_key(self, key, version=None):
         """

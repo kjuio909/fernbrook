@@ -336,6 +336,10 @@ class BaseCacheTests:
     # with a non-integer value.
     incr_decr_type_error = TypeError
 
+    # Shortest term a value may be given in the expiry tests below. Memcached
+    # can't express sub-second expirations, so its test case overrides this.
+    short_timeout = 0.05
+
     def tearDown(self):
         cache.clear()
 
@@ -1250,6 +1254,18 @@ class BaseCacheTests:
             # hop on some backends under load.
             await asyncio.sleep(0.005)
 
+    async def _wait_for_aget_or_set_expiry(self, concrete_cache, key, timeout=5):
+        """Wait until a live entry reads as expired."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            if not await concrete_cache.ahas_key(key):
+                return
+            # Yield long enough for a sub-second (locmem, file, db) term to
+            # pass; memcached overrides short_timeout to a full second.
+            await asyncio.sleep(max(0.02, self.short_timeout))
+        self.fail("Timed out waiting for %r to expire." % key)
+
     def test_get_or_set_concurrent_miss_single_generation(self):
         """Concurrent misses generate the callable default only once."""
         concrete_cache = caches["default"]
@@ -1782,6 +1798,164 @@ class BaseCacheTests:
         gate.set()
         # The waiter joined the still-registered round.
         self.assertEqual(await asyncio.gather(leader, waiter), ["generated"] * 2)
+
+    async def test_aget_or_set_expired_entry_starts_new_round(self):
+        """An entry that expires during a paused round starts a new round."""
+        gate = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def slow_default():
+            entered.set()
+            await gate.wait()
+            return "old"
+
+        retired = asyncio.create_task(cache.aget_or_set("key", slow_default))
+        await entered.wait()
+        # An external write populates the entry while the first round is
+        # paused; its term then naturally expires before the new request.
+        await cache.aset("key", "external", timeout=self.short_timeout)
+        await self._wait_for_aget_or_set_expiry(cache, "key")
+        # The new request confirms the miss itself and never waits for the
+        # paused round.
+        self.assertEqual(await cache.aget_or_set("key", "new"), "new")
+        # The old round's late success can't overwrite the committed value;
+        # its participant observes the committed value.
+        gate.set()
+        self.assertEqual(await retired, "new")
+        self.assertEqual(await cache.aget("key"), "new")
+
+    async def test_aget_or_set_expired_round_failure_not_propagated(self):
+        """A round retired by natural expiry doesn't leak its failure."""
+        gate = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def failing_default():
+            entered.set()
+            await gate.wait()
+            raise ValueError("boom-old")
+
+        retired = asyncio.create_task(cache.aget_or_set("key", failing_default))
+        await entered.wait()
+        await cache.aset("key", "external", timeout=self.short_timeout)
+        await self._wait_for_aget_or_set_expiry(cache, "key")
+        self.assertEqual(await cache.aget_or_set("key", "new"), "new")
+        gate.set()
+        with self.assertRaises(ValueError):
+            await retired
+        # The failure reached only the old round's participant; later calls
+        # see the committed value and no trace of the failure.
+        self.assertEqual(await cache.aget("key"), "new")
+        self.assertEqual(await cache.aget_or_set("key", "other"), "new")
+
+    async def test_aget_or_set_expired_round_cancellation_isolated(self):
+        """Cancelling a retired, paused round doesn't disturb the new value."""
+        gate = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def slow_default():
+            entered.set()
+            await gate.wait()
+            return "old"
+
+        retired = asyncio.create_task(cache.aget_or_set("key", slow_default))
+        await entered.wait()
+        await cache.aset("key", "external", timeout=self.short_timeout)
+        await self._wait_for_aget_or_set_expiry(cache, "key")
+        self.assertEqual(await cache.aget_or_set("key", "new"), "new")
+        retired.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await retired
+        self.assertEqual(await cache.aget("key"), "new")
+        self.assertEqual(await cache.aget_or_set("key", "other"), "new")
+
+    async def test_aget_or_set_after_expiry_single_new_generation(self):
+        """Races after an expiry coalesce into one new shared generation."""
+        calls = 0
+        first_gate, entered = asyncio.Event(), asyncio.Event()
+
+        async def slow_default():
+            entered.set()
+            await first_gate.wait()
+            return "old"
+
+        retired = asyncio.create_task(cache.aget_or_set("key", slow_default))
+        await entered.wait()
+        await cache.aset("key", "external", timeout=self.short_timeout)
+        await self._wait_for_aget_or_set_expiry(cache, "key")
+
+        new_gate = asyncio.Event()
+
+        async def new_default():
+            nonlocal calls
+            calls += 1
+            await new_gate.wait()
+            return "new"
+
+        tasks = [
+            asyncio.create_task(cache.aget_or_set("key", new_default)) for _ in range(3)
+        ]
+        await self._wait_for_aget_or_set_participants(cache, "key", 3)
+        new_gate.set()
+        self.assertEqual(await asyncio.gather(*tasks), ["new"] * 3)
+        self.assertEqual(calls, 1)
+        first_gate.set()
+        self.assertEqual(await retired, "new")
+        self.assertEqual(await cache.aget("key"), "new")
+
+    async def test_aget_or_set_cancel_waiter_in_new_round_after_expiry(self):
+        """Cancelling one new-round waiter leaves the other participants."""
+        first_gate, entered = asyncio.Event(), asyncio.Event()
+
+        async def slow_default():
+            entered.set()
+            await first_gate.wait()
+            return "old"
+
+        retired = asyncio.create_task(cache.aget_or_set("key", slow_default))
+        await entered.wait()
+        await cache.aset("key", "external", timeout=self.short_timeout)
+        await self._wait_for_aget_or_set_expiry(cache, "key")
+
+        new_gate = asyncio.Event()
+
+        async def new_default():
+            await new_gate.wait()
+            return "new"
+
+        leader = asyncio.create_task(cache.aget_or_set("key", new_default))
+        await self._wait_for_aget_or_set_participants(cache, "key", 1)
+        cancelled_waiter = asyncio.create_task(cache.aget_or_set("key", new_default))
+        waiter = asyncio.create_task(cache.aget_or_set("key", new_default))
+        await self._wait_for_aget_or_set_participants(cache, "key", 3)
+        cancelled_waiter.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancelled_waiter
+        new_gate.set()
+        self.assertEqual(await leader, "new")
+        self.assertEqual(await waiter, "new")
+        first_gate.set()
+        self.assertEqual(await retired, "new")
+        self.assertEqual(await cache.aget("key"), "new")
+
+    async def test_aget_or_set_clear_during_generation_starts_new_round(self):
+        """Clearing the cache retires a paused round instead of joining it."""
+        gate = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def slow_default():
+            entered.set()
+            await gate.wait()
+            return "old"
+
+        retired = asyncio.create_task(cache.aget_or_set("key", slow_default))
+        await entered.wait()
+        await cache.aset("key", "external")
+        await cache.aclear()
+        # The new request confirms the miss and completes independently.
+        self.assertEqual(await cache.aget_or_set("key", "new"), "new")
+        gate.set()
+        self.assertEqual(await retired, "new")
+        self.assertEqual(await cache.aget("key"), "new")
 
     async def test_aget_or_set_zero_timeout(self):
         """An explicit zero timeout returns the value without storing it."""
@@ -2483,6 +2657,8 @@ class BaseMemcachedTests(BaseCacheTests):
     # By default it's assumed that the client doesn't clean up connections
     # properly, in which case the backend must do so after each request.
     should_disconnect_on_close = True
+    # Memcached only honors whole-second (and minimum one-second) terms.
+    short_timeout = 1
 
     def test_location_multiple_servers(self):
         locations = [
@@ -2811,6 +2987,10 @@ class FileBasedCacheTests(BaseCacheTests, TestCase):
     )
 )
 class RedisCacheTests(BaseCacheTests, TestCase):
+    # Keep expiry tests on a whole-second term to avoid client/server TTL
+    # rounding.
+    short_timeout = 1
+
     def setUp(self):
         import redis
 

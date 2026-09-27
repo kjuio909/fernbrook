@@ -234,7 +234,11 @@ Caching
   same guarantees for concurrent asynchronous calls. Cancelling one caller
   only cancels that call; the generation continues for any other caller, and
   cancelling every caller abandons the uncommitted generation without
-  leaving stale state.
+  leaving stale state. In addition, if a cache entry is deleted, cleared, or
+  expires while an asynchronous generation is in flight, a later call that
+  misses the entry no longer waits for or joins that generation: it confirms
+  the miss itself and begins a new generation, isolated from the old
+  generation's eventual value, exception, or cancellation.
 
 CSP
 ~~~

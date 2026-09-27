@@ -1031,6 +1031,14 @@ guarantees for concurrent coroutines: cancelling a single caller leaves a
 generation that still has participants intact, while cancelling all
 participants abandons the uncommitted generation without caching a value.
 
+A generation is tied to the state of the cache entry at the moment it starts.
+If the entry is deleted, cleared, or expires while an ``aget_or_set()``
+generation is in flight, a later call that misses the entry does not wait for
+or join the old generation; it independently confirms the miss and starts a new
+generation. The old generation's eventual value, exception, or cancellation is
+shared only by the callers that joined it and never overwrites a value
+committed (or written by another writer) after the entry was invalidated.
+
 .. method:: cache.get_many(keys, version=None)
 
 There's also a ``get_many()`` interface that only hits the cache once.

@@ -54,6 +54,9 @@ class LocMemCache(BaseCache):
         pickled = pickle.dumps(value, self.pickle_protocol)
         with self._lock:
             self._set(key, pickled, timeout)
+        # An unconditional write outlives any generation in flight: if it is
+        # later deleted or expires, a later miss must not rejoin that round.
+        self._note_aget_or_set_repopulation(key)
 
     def touch(self, key, timeout=DEFAULT_TIMEOUT, version=None):
         key = self.make_and_validate_key(key, version=version)
@@ -93,6 +96,7 @@ class LocMemCache(BaseCache):
         if self._cull_frequency == 0:
             self._cache.clear()
             self._expire_info.clear()
+            self._retire_all_aget_or_set_in_flight()
         else:
             count = len(self._cache) // self._cull_frequency
             for i in range(count):
@@ -117,3 +121,4 @@ class LocMemCache(BaseCache):
         with self._lock:
             self._cache.clear()
             self._expire_info.clear()
+            self._retire_all_aget_or_set_in_flight()
