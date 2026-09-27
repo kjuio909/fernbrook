@@ -369,6 +369,20 @@ class BaseCache:
         # have separate rounds and never block each other. The registry is
         # only touched at synchronous points here, so it needs no lock.
         in_flight = self._aget_or_set_in_flight.get(made_key)
+        if in_flight is not None and in_flight.task.done():
+            # The registered round already reached its outcome but its
+            # participants haven't finished unwinding, so it hasn't been
+            # cleaned up yet. A new miss request must not join a finished
+            # round — inheriting a stale failure (or an uncommitted result)
+            # would make the outcome depend on event loop scheduling. Retire
+            # the round now so this call re-determines the state of the
+            # cache entry from scratch. The finished round's participants
+            # still hold their own reference to it and observe its outcome;
+            # the identity checks below keep their cleanup away from the
+            # round started here.
+            self._aget_or_set_in_flight.pop(made_key, None)
+            _discard_generation_result(in_flight.task)
+            in_flight = None
         if in_flight is not None:
             in_flight.join()
         else:

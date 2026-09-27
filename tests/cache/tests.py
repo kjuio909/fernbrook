@@ -26,7 +26,12 @@ from django.core.cache import (
     cache,
     caches,
 )
-from django.core.cache.backends.base import BaseCache, InvalidCacheBackendError
+from django.core.cache.backends.base import (
+    DEFAULT_TIMEOUT,
+    BaseCache,
+    InvalidCacheBackendError,
+    _AsyncInFlightGeneration,
+)
 from django.core.cache.backends.redis import RedisCacheClient
 from django.core.cache.utils import make_template_fragment_key
 from django.db import close_old_connections, connection, connections
@@ -1852,6 +1857,46 @@ class BaseCacheTests:
         self.assertIs(results[0], results[1])
         # The failed round left no state; a later call may retry.
         self.assertEqual(await cache.aget_or_set("key", "recovered"), "recovered")
+
+    async def test_aget_or_set_finished_failed_round_not_joined(self):
+        """A new call never inherits the failure of a finished round."""
+        async def failing_default():
+            raise ValueError("stale failure")
+
+        # A round whose generation already failed, still registered because
+        # its participants haven't finished unwinding.
+        in_flight = _AsyncInFlightGeneration(
+            cache._aget_or_set_generate("key", failing_default, DEFAULT_TIMEOUT, None)
+        )
+        cache._aget_or_set_in_flight[cache.make_key("key")] = in_flight
+        await asyncio.sleep(0.01)  # Let the generation task fail.
+        self.assertTrue(in_flight.task.done())
+        try:
+            # The finished round is retired, not joined: the miss is
+            # re-determined and a fresh value generated.
+            self.assertEqual(await cache.aget_or_set("key", "fresh"), "fresh")
+            self.assertEqual(await cache.aget("key"), "fresh")
+        finally:
+            in_flight.task.exception()  # Retire the unused stale outcome.
+
+    async def test_aget_or_set_finished_successful_round_not_joined(self):
+        """A new call after a finished round re-reads the committed value."""
+        calls = 0
+
+        async def default():
+            nonlocal calls
+            calls += 1
+            return "value"
+
+        in_flight = _AsyncInFlightGeneration(
+            cache._aget_or_set_generate("key", default, DEFAULT_TIMEOUT, None)
+        )
+        cache._aget_or_set_in_flight[cache.make_key("key")] = in_flight
+        await asyncio.sleep(0.01)  # Let the generation task commit.
+        self.assertTrue(in_flight.task.done())
+        # The committed value is observed without running the default again.
+        self.assertEqual(await cache.aget_or_set("key", default), "value")
+        self.assertEqual(calls, 1)
 
     async def test_aget_or_set_awaitable_callable(self):
         """A callable may return any awaitable, not only a coroutine."""
