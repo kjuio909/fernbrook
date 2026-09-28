@@ -1,0 +1,520 @@
+import asyncio
+
+from django.core.exceptions import ValidationError
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.forms import (
+    BooleanField,
+    CharField,
+    ChoiceField,
+    ComboField,
+    EmailField,
+    FileField,
+    Form,
+    SplitDateTimeField,
+)
+from django.test import SimpleTestCase
+
+
+def async_validator(message=None):
+    async def validator(value):
+        await asyncio.sleep(0)
+        if message is not None:
+            raise ValidationError(message)
+
+    return validator
+
+
+def sync_validator(message=None):
+    def validator(value):
+        if message is not None:
+            raise ValidationError(message)
+
+    return validator
+
+
+class SimplePersonForm(Form):
+    first_name = CharField()
+    last_name = CharField()
+
+
+class AsyncIsValidTests(SimpleTestCase):
+    async def test_all_sync_valid(self):
+        form = SimplePersonForm({"first_name": "John", "last_name": "Lennon"})
+        self.assertIs(await form.ais_valid(), True)
+        self.assertEqual(
+            form.cleaned_data,
+            {"first_name": "John", "last_name": "Lennon"},
+        )
+
+    async def test_all_sync_invalid_matches_sync(self):
+        data = {"first_name": "John"}
+        sync_form = SimplePersonForm(data)
+        self.assertIs(sync_form.is_valid(), False)
+        async_form = SimplePersonForm(data)
+        self.assertIs(await async_form.ais_valid(), False)
+        self.assertEqual(
+            async_form.errors.as_json(), sync_form.errors.as_json()
+        )
+
+    async def test_unbound_is_invalid(self):
+        form = SimplePersonForm()
+        self.assertIs(await form.ais_valid(), False)
+        self.assertEqual(dict(form.errors), {})
+
+    async def test_async_validator_awaited(self):
+        form = SimplePersonForm({"first_name": "John", "last_name": "Lennon"})
+        form.fields["first_name"].validators.append(async_validator())
+        self.assertIs(await form.ais_valid(), True)
+
+    async def test_async_validator_error_attribution(self):
+        form = SimplePersonForm({"first_name": "John", "last_name": "Lennon"})
+        form.fields["last_name"].validators.append(
+            async_validator("async bad last name")
+        )
+        self.assertIs(await form.ais_valid(), False)
+        self.assertIn("last_name", form.errors)
+        self.assertIn("async bad last name", str(form.errors["last_name"]))
+        self.assertNotIn("last_name", form.cleaned_data)
+
+    async def test_mixed_sync_async_validator_order(self):
+        order = []
+
+        def make_sync(tag):
+            def validator(value):
+                order.append(("sync", tag))
+
+            return validator
+
+        def make_async(tag):
+            async def validator(value):
+                await asyncio.sleep(0)
+                order.append(("async", tag))
+
+            return validator
+
+        class F(Form):
+            value = CharField(
+                validators=[
+                    make_sync("1"),
+                    make_async("2"),
+                    make_sync("3"),
+                ]
+            )
+
+        form = F({"value": "x"})
+        await form.ais_valid()
+        self.assertEqual(
+            order,
+            [("sync", "1"), ("async", "2"), ("sync", "3")],
+        )
+
+    async def test_mixed_validator_errors_aggregated_once(self):
+        def sync_fail(value):
+            raise ValidationError("alpha")
+
+        class F(Form):
+            value = CharField(validators=[sync_fail, async_validator("beta")])
+
+        form = F({"value": "x"})
+        self.assertIs(await form.ais_valid(), False)
+        messages = str(form.errors["value"])
+        self.assertEqual(messages.count("alpha"), 1)
+        self.assertEqual(messages.count("beta"), 1)
+
+    async def test_async_clean_field_hook(self):
+        class F(Form):
+            name = CharField()
+
+            async def clean_name(self):
+                await asyncio.sleep(0)
+                return self.cleaned_data["name"].upper()
+
+        form = F({"name": "john"})
+        self.assertIs(await form.ais_valid(), True)
+        self.assertEqual(form.cleaned_data["name"], "JOHN")
+
+    async def test_async_clean_field_error(self):
+        class F(Form):
+            name = CharField()
+
+            async def clean_name(self):
+                await asyncio.sleep(0)
+                raise ValidationError("hook-bad")
+
+        form = F({"name": "john"})
+        self.assertIs(await form.ais_valid(), False)
+        self.assertIn("hook-bad", str(form.errors["name"]))
+        self.assertNotIn("name", form.cleaned_data)
+
+    async def test_field_cleaning_in_declaration_order(self):
+        seen = []
+        first_seen_by_second = []
+
+        class F(Form):
+            first = CharField()
+            second = CharField()
+
+            async def clean_first(self):
+                seen.append("first-start")
+                await asyncio.sleep(0)
+                seen.append("first-end")
+                return self.cleaned_data["first"]
+
+            async def clean_second(self):
+                seen.append("second-start")
+                # self here is the form: the first field must already have
+                # finished when the second field is cleaned.
+                first_seen_by_second.append("first" in self.cleaned_data)
+                await asyncio.sleep(0)
+                seen.append("second-end")
+                return self.cleaned_data["second"]
+
+        form = F({"first": "1", "second": "2"})
+        await form.ais_valid()
+        self.assertEqual(
+            seen,
+            ["first-start", "first-end", "second-start", "second-end"],
+        )
+        self.assertEqual(first_seen_by_second, [True])
+
+    async def test_async_form_clean_nonfield_error(self):
+        class F(Form):
+            name = CharField()
+
+            async def clean(self):
+                await asyncio.sleep(0)
+                raise ValidationError("form-wide")
+
+        form = F({"name": "x"})
+        self.assertIs(await form.ais_valid(), False)
+        self.assertIn("form-wide", str(form.non_field_errors()))
+
+    async def test_async_form_clean_replaces_cleaned_data(self):
+        class F(Form):
+            name = CharField()
+
+            async def clean(self):
+                await asyncio.sleep(0)
+                return {"name": "replaced"}
+
+        form = F({"name": "x"})
+        await form.ais_valid()
+        self.assertEqual(form.cleaned_data, {"name": "replaced"})
+
+    async def test_repeated_calls_run_validators_once(self):
+        class F(Form):
+            name = CharField()
+
+            def __init__(self, *args, **kwargs):
+                self.calls = 0
+                super().__init__(*args, **kwargs)
+
+            async def count_validator(self, value):
+                self.calls += 1
+                await asyncio.sleep(0)
+
+        form = F({"name": "x"})
+        form.fields["name"].validators.append(form.count_validator)
+        await form.ais_valid()
+        await form.ais_valid()
+        self.assertEqual(form.calls, 1)
+
+    async def test_async_reuses_completed_sync_validation(self):
+        class F(Form):
+            name = CharField()
+
+            def __init__(self, *args, **kwargs):
+                self.sync_calls = 0
+                super().__init__(*args, **kwargs)
+
+            def counting_validator(self, value):
+                self.sync_calls += 1
+
+        form = F({"name": "x"})
+        form.fields["name"].validators.append(form.counting_validator)
+        self.assertIs(form.is_valid(), True)
+        self.assertIs(await form.ais_valid(), True)
+        self.assertEqual(form.sync_calls, 1)
+
+    async def test_sync_reuses_completed_async_validation(self):
+        class F(Form):
+            name = CharField()
+
+            def __init__(self, *args, **kwargs):
+                self.calls = 0
+                super().__init__(*args, **kwargs)
+
+            async def counting_validator(self, value):
+                self.calls += 1
+                await asyncio.sleep(0)
+
+        form = F({"name": "x"})
+        form.fields["name"].validators.append(form.counting_validator)
+        self.assertIs(await form.ais_valid(), True)
+        self.assertIs(form.is_valid(), True)
+        self.assertEqual(form.calls, 1)
+
+    async def test_changed_inputs_trigger_new_round(self):
+        class F(Form):
+            name = CharField()
+
+            def __init__(self, *args, **kwargs):
+                self.calls = 0
+                super().__init__(*args, **kwargs)
+
+            async def counting_validator(self, value):
+                self.calls += 1
+                await asyncio.sleep(0)
+
+        form = F({"name": "a"})
+        form.fields["name"].validators.append(form.counting_validator)
+        await form.ais_valid()
+        self.assertEqual(form.calls, 1)
+
+        # Same inputs: cached, no re-run.
+        await form.ais_valid()
+        self.assertEqual(form.calls, 1)
+
+        # Replacing the bound data (new object) invalidates the cache and
+        # causes a complete fresh round against the new inputs.
+        form.data = {"name": "b"}
+        await form.ais_valid()
+        self.assertEqual(form.calls, 2)
+        self.assertEqual(form.cleaned_data["name"], "b")
+
+    async def test_empty_permitted_short_circuit(self):
+        form = SimplePersonForm({}, empty_permitted=True, use_required_attribute=False)
+        self.assertIs(await form.ais_valid(), True)
+        self.assertEqual(dict(form.errors), {})
+
+
+class AsyncFieldTypesTests(SimpleTestCase):
+    async def test_combo_field(self):
+        class F(Form):
+            value = ComboField(fields=[CharField(max_length=10), EmailField()])
+
+        valid = F({"value": "a@b.co"})
+        self.assertIs(await valid.ais_valid(), True)
+        invalid = F({"value": "not-an-email"})
+        self.assertIs(await invalid.ais_valid(), False)
+        sync_invalid = F({"value": "not-an-email"})
+        sync_invalid.is_valid()
+        self.assertEqual(invalid.errors.as_json(), sync_invalid.errors.as_json())
+
+    async def test_split_datetime_field_parity(self):
+        data = {"dt_0": "2026-01-02", "dt_1": "03:30:45"}
+
+        class F(Form):
+            dt = SplitDateTimeField()
+
+        async_form = F(data)
+        sync_form = F(data)
+        self.assertIs(await async_form.ais_valid(), True)
+        sync_form.is_valid()
+        self.assertEqual(async_form.cleaned_data, sync_form.cleaned_data)
+
+    async def test_file_field_parity(self):
+        class F(Form):
+            upload = FileField(required=False)
+
+        uploaded = SimpleUploadedFile("x.txt", b"hello", content_type="text/plain")
+        async_form = F({}, {"upload": uploaded})
+        sync_form = F({}, {"upload": uploaded})
+        self.assertIs(await async_form.ais_valid(), True)
+        sync_form.is_valid()
+        self.assertEqual(async_form.cleaned_data, sync_form.cleaned_data)
+
+    async def test_disabled_field_uses_initial(self):
+        class F(Form):
+            name = CharField(disabled=True)
+
+        async_form = F({"name": "posted"}, initial={"name": "initial"})
+        sync_form = F({"name": "posted"}, initial={"name": "initial"})
+        self.assertIs(await async_form.ais_valid(), True)
+        sync_form.is_valid()
+        self.assertEqual(async_form.cleaned_data, sync_form.cleaned_data)
+        self.assertEqual(async_form.cleaned_data["name"], "initial")
+
+
+class AsyncConcurrencyTests(SimpleTestCase):
+    async def test_concurrent_calls_share_one_round(self):
+        gate = asyncio.Event()
+
+        class F(Form):
+            name = CharField()
+
+            def __init__(self, *args, **kwargs):
+                self.calls = 0
+                super().__init__(*args, **kwargs)
+
+            async def gated_validator(self, value):
+                self.calls += 1
+                await gate.wait()
+
+        form = F({"name": "x"})
+        form.fields["name"].validators.append(form.gated_validator)
+
+        tasks = [asyncio.create_task(form.ais_valid()) for _ in range(3)]
+        await asyncio.sleep(0)
+        # Mid-flight reads from other tasks see no half-finished state.
+        self.assertEqual(dict(form.errors), {})
+        self.assertEqual(form.cleaned_data, {})
+        gate.set()
+        results = await asyncio.gather(*tasks)
+        self.assertEqual(results, [True, True, True])
+        self.assertEqual(form.calls, 1)
+
+    async def test_concurrent_validation_error_shared(self):
+        gate = asyncio.Event()
+
+        class F(Form):
+            name = CharField()
+
+            async def gated_validator(self, value):
+                await gate.wait()
+                raise ValidationError("shared-bad")
+
+        form = F({"name": "x"})
+        form.fields["name"].validators.append(form.gated_validator)
+        tasks = [asyncio.create_task(form.ais_valid()) for _ in range(3)]
+        await asyncio.sleep(0)
+        gate.set()
+        results = await asyncio.gather(*tasks)
+        self.assertEqual(results, [False, False, False])
+        self.assertEqual(len(form.errors.as_data()["name"]), 1)
+        self.assertIn("shared-bad", str(form.errors["name"]))
+
+    async def test_concurrent_ordinary_exception_propagates(self):
+        gate = asyncio.Event()
+
+        class F(Form):
+            name = CharField()
+
+            async def boom(self, value):
+                await gate.wait()
+                raise RuntimeError("boom-shared")
+
+        form = F({"name": "x"})
+        form.fields["name"].validators.append(form.boom)
+        tasks = [asyncio.create_task(form.ais_valid()) for _ in range(2)]
+        await asyncio.sleep(0)
+        gate.set()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(isinstance(r, RuntimeError) for r in results))
+        self.assertTrue(all("boom-shared" in str(r) for r in results))
+        self.assertIsNone(form._errors)
+
+    async def test_cancel_one_waiter_round_continues(self):
+        gate = asyncio.Event()
+
+        class F(Form):
+            name = CharField()
+
+            async def gated_validator(self, value):
+                await gate.wait()
+
+        form = F({"name": "x"})
+        form.fields["name"].validators.append(form.gated_validator)
+        keep = asyncio.create_task(form.ais_valid())
+        cancels = asyncio.create_task(form.ais_valid())
+        await asyncio.sleep(0)
+        cancels.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancels
+        gate.set()
+        self.assertIs(await keep, True)
+
+    async def test_all_waiters_cancel_then_retry_reruns(self):
+        gate = asyncio.Event()
+
+        class F(Form):
+            name = CharField()
+
+            def __init__(self, *args, **kwargs):
+                self.calls = 0
+                super().__init__(*args, **kwargs)
+
+            async def gated_validator(self, value):
+                self.calls += 1
+                await gate.wait()
+
+        form = F({"name": "x"})
+        form.fields["name"].validators.append(form.gated_validator)
+        only = asyncio.create_task(form.ais_valid())
+        await asyncio.sleep(0)
+        only.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await only
+        await asyncio.sleep(0.05)
+        # The abandoned round left no errors or cached failure.
+        self.assertIsNone(form._errors)
+        gate.set()
+        await asyncio.sleep(0.05)
+        # A subsequent call performs a complete retry.
+        calls = form.calls
+        self.assertIs(await form.ais_valid(), True)
+        self.assertGreater(form.calls, calls)
+
+    async def test_surviving_waiter_gets_error_after_other_cancels(self):
+        gate = asyncio.Event()
+
+        class F(Form):
+            name = CharField()
+
+            async def gated_fail(self, value):
+                await gate.wait()
+                raise ValidationError("only-other")
+
+        form = F({"name": "x"})
+        form.fields["name"].validators.append(form.gated_fail)
+        cancels = asyncio.create_task(form.ais_valid())
+        keep = asyncio.create_task(form.ais_valid())
+        await asyncio.sleep(0)
+        cancels.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await cancels
+        gate.set()
+        self.assertIs(await keep, False)
+        self.assertIn("only-other", str(form.errors["name"]))
+
+    async def test_ordinary_exception_not_cached(self):
+        class F(Form):
+            name = CharField()
+
+            calls = 0
+
+            def boom(self, value):
+                type(self).calls += 1
+                raise RuntimeError("kaboom")
+
+        form = F({"name": "x"})
+        form.fields["name"].validators.append(form.boom)
+        with self.assertRaises(RuntimeError):
+            await form.ais_valid()
+        with self.assertRaises(RuntimeError):
+            await form.ais_valid()
+        self.assertEqual(F.calls, 2)
+
+
+class AsyncChoiceFieldTests(SimpleTestCase):
+    async def test_choice_field_async_valid(self):
+        class F(Form):
+            pick = ChoiceField(choices=[("a", "A"), ("b", "B")])
+
+        form = F({"pick": "a"})
+        self.assertIs(await form.ais_valid(), True)
+
+        invalid = F({"pick": "z"})
+        self.assertIs(await invalid.ais_valid(), False)
+        self.assertIn("pick", invalid.errors)
+
+
+class AsyncBooleanFieldTests(SimpleTestCase):
+    async def test_boolean_field_required(self):
+        class F(Form):
+            agreed = BooleanField()
+
+        form = F({})
+        self.assertIs(await form.ais_valid(), False)
+        self.assertIn("agreed", form.errors)

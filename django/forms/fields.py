@@ -4,6 +4,7 @@ Field classes.
 
 import copy
 import datetime
+import inspect
 import json
 import math
 import operator
@@ -200,6 +201,29 @@ class Field:
         if errors:
             raise ValidationError(errors)
 
+    async def arun_validators(self, value):
+        """Async counterpart of run_validators().
+
+        Each validator is called in declaration order; a validator that
+        returns an awaitable result is awaited before the next validator
+        runs. ValidationErrors are collected exactly like the synchronous
+        path; any other exception propagates immediately.
+        """
+        if value in self.empty_values:
+            return
+        errors = []
+        for v in self.validators:
+            try:
+                result = v(value)
+                if inspect.isawaitable(result):
+                    await result
+            except ValidationError as e:
+                if hasattr(e, "code") and e.code in self.error_messages:
+                    e.message = self.error_messages[e.code]
+                errors.extend(e.error_list)
+        if errors:
+            raise ValidationError(errors)
+
     def clean(self, value):
         """
         Validate the given value and return its "cleaned" value as an
@@ -208,6 +232,26 @@ class Field:
         value = self.to_python(value)
         self.validate(value)
         self.run_validators(value)
+        return value
+
+    async def aclean(self, value):
+        """
+        Async counterpart of clean().
+
+        A subclass that overrides clean() with a coroutine function is
+        awaited directly; otherwise the synchronous to_python/validate
+        stages run unchanged and validators are dispatched through the
+        async pipeline, preserving declaration order and error handling.
+        """
+        if inspect.iscoroutinefunction(self.clean):
+            return await self.clean(value)
+        value = self.to_python(value)
+        if inspect.isawaitable(value):
+            value = await value
+        validation = self.validate(value)
+        if inspect.isawaitable(validation):
+            await validation
+        await self.arun_validators(value)
         return value
 
     def bound_data(self, data, initial):
@@ -271,6 +315,10 @@ class Field:
     def _clean_bound_field(self, bf):
         value = bf.initial if self.disabled else bf.data
         return self.clean(value)
+
+    async def _aclean_bound_field(self, bf):
+        value = bf.initial if self.disabled else bf.data
+        return await self.aclean(value)
 
 
 class CharField(Field):
@@ -699,6 +747,23 @@ class FileField(Field):
             return initial
         return super().clean(data)
 
+    async def aclean(self, data, initial=None):
+        if inspect.iscoroutinefunction(self.clean):
+            return await self.clean(data, initial)
+        # Mirror the synchronous preprocessing of clean() before dispatching
+        # through the async field pipeline.
+        if data is FILE_INPUT_CONTRADICTION:
+            raise ValidationError(
+                self.error_messages["contradiction"], code="contradiction"
+            )
+        if data is False:
+            if not self.required:
+                return False
+            data = None
+        if not data and initial:
+            return initial
+        return await super().aclean(data)
+
     def bound_data(self, _, initial):
         return initial
 
@@ -708,6 +773,10 @@ class FileField(Field):
     def _clean_bound_field(self, bf):
         value = bf.initial if self.disabled else bf.data
         return self.clean(value, bf.initial)
+
+    async def _aclean_bound_field(self, bf):
+        value = bf.initial if self.disabled else bf.data
+        return await self.aclean(value, bf.initial)
 
 
 class ImageField(FileField):
@@ -942,6 +1011,12 @@ class TypedChoiceField(ChoiceField):
         value = super().clean(value)
         return self._coerce(value)
 
+    async def aclean(self, value):
+        if inspect.iscoroutinefunction(self.clean):
+            return await self.clean(value)
+        value = await super().aclean(value)
+        return self._coerce(value)
+
 
 class MultipleChoiceField(ChoiceField):
     hidden_widget = MultipleHiddenInput
@@ -1019,6 +1094,12 @@ class TypedMultipleChoiceField(MultipleChoiceField):
         value = super().clean(value)
         return self._coerce(value)
 
+    async def aclean(self, value):
+        if inspect.iscoroutinefunction(self.clean):
+            return await self.clean(value)
+        value = await super().aclean(value)
+        return self._coerce(value)
+
     def validate(self, value):
         if value != self.empty_value:
             super().validate(value)
@@ -1048,6 +1129,14 @@ class ComboField(Field):
         super().clean(value)
         for field in self.fields:
             value = field.clean(value)
+        return value
+
+    async def aclean(self, value):
+        if inspect.iscoroutinefunction(self.clean):
+            return await self.clean(value)
+        await super().aclean(value)
+        for field in self.fields:
+            value = await field.aclean(value)
         return value
 
 
@@ -1152,6 +1241,70 @@ class MultiValueField(Field):
         out = self.compress(clean_data)
         self.validate(out)
         self.run_validators(out)
+        return out
+
+    async def aclean(self, value):
+        """
+        Async counterpart of clean(). Each subfield is cleaned in order
+        through its async pipeline; subfield errors are collected exactly
+        like the synchronous path.
+        """
+        if inspect.iscoroutinefunction(self.clean):
+            return await self.clean(value)
+        clean_data = []
+        errors = []
+        if self.disabled and not isinstance(value, list):
+            value = self.widget.decompress(value)
+        if not value or isinstance(value, (list, tuple)):
+            if not value or not [v for v in value if v not in self.empty_values]:
+                if self.required:
+                    raise ValidationError(
+                        self.error_messages["required"], code="required"
+                    )
+                else:
+                    out = self.compress([])
+                    if inspect.isawaitable(out):
+                        out = await out
+                    return out
+        else:
+            raise ValidationError(self.error_messages["invalid"], code="invalid")
+        for i, field in enumerate(self.fields):
+            try:
+                field_value = value[i]
+            except IndexError:
+                field_value = None
+            if field_value in self.empty_values:
+                if self.require_all_fields:
+                    # Raise a 'required' error if the MultiValueField is
+                    # required and any field is empty.
+                    if self.required:
+                        raise ValidationError(
+                            self.error_messages["required"], code="required"
+                        )
+                elif field.required:
+                    # Otherwise, add an 'incomplete' error to the list of
+                    # collected errors and skip field cleaning, if a required
+                    # field is empty.
+                    if field.error_messages["incomplete"] not in errors:
+                        errors.append(field.error_messages["incomplete"])
+                    continue
+            try:
+                clean_data.append(await field.aclean(field_value))
+            except ValidationError as e:
+                # Collect all validation errors in a single list, which we'll
+                # raise at the end of aclean(), rather than raising a single
+                # exception for the first error we encounter. Skip duplicates.
+                errors.extend(m for m in e.error_list if m not in errors)
+        if errors:
+            raise ValidationError(errors)
+
+        out = self.compress(clean_data)
+        if inspect.isawaitable(out):
+            out = await out
+        validation = self.validate(out)
+        if inspect.isawaitable(validation):
+            await validation
+        await self.arun_validators(out)
         return out
 
     def compress(self, data_list):

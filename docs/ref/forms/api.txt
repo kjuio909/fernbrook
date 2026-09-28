@@ -121,6 +121,25 @@ valid email address:
     >>> f.is_valid()
     False
 
+.. method:: Form.ais_valid()
+
+Asynchronous version of :meth:`~Form.is_valid` for use in ASGI views. Field
+validators, ``clean_<field>()`` methods and the form-wide :meth:`~Form.clean`
+method may return an awaitable result; it is awaited before validation
+continues. The return value, the contents of :attr:`~Form.errors` and
+``cleaned_data`` are identical to running :meth:`~Form.is_valid` on the same
+data:
+
+.. code-block:: pycon
+
+    >>> f = ContactForm(data)
+    >>> await f.ais_valid()
+    False
+
+Concurrent calls share a single validation run, so validators with side
+effects run only once. A run abandoned because every caller was cancelled is
+not cached; the next call performs a full re-validation.
+
 .. attribute:: Form.errors
 
 Access the :attr:`~Form.errors` attribute to get a dictionary of error

@@ -2,8 +2,10 @@
 Form classes
 """
 
+import asyncio
 import copy
 import datetime
+import inspect
 
 from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
 from django.forms.fields import Field
@@ -16,6 +18,10 @@ from django.utils.translation import gettext as _
 from .renderers import get_default_renderer
 
 __all__ = ("BaseForm", "Form")
+
+# Marker for "cleaned_data was never populated" (accessing it raises
+# AttributeError, as on a form that has never been validated).
+_UNSET = object()
 
 
 class DeclarativeFieldsMetaclass(MediaDefiningClass):
@@ -47,6 +53,28 @@ class DeclarativeFieldsMetaclass(MediaDefiningClass):
         new_class.declared_fields = declared_fields
 
         return new_class
+
+
+class _AsyncValidationState:
+    """Bookkeeping for a single asynchronous validation round.
+
+    Several concurrent ``BaseForm.ais_valid()`` calls share one state (and
+    one runner task) so that side-effectful validators run only once per
+    round.
+    """
+
+    def __init__(self, *, previous_errors, previous_cleaned_data, inputs):
+        self.runner_task = None
+        # Number of ais_valid() callers currently awaiting the runner task.
+        self.waiters = 0
+        # Set once the round has either completed or been abandoned.
+        self.finalized = False
+        # State to restore if the round is abandoned because every waiter
+        # was cancelled.
+        self.previous_errors = previous_errors
+        self.previous_cleaned_data = previous_cleaned_data
+        # Identity snapshot of (data, files, initial) the round is cleaning.
+        self.inputs = inputs
 
 
 class BaseForm(RenderableFormMixin):
@@ -97,6 +125,16 @@ class BaseForm(RenderableFormMixin):
         self.label_suffix = label_suffix if label_suffix is not None else _(":")
         self.empty_permitted = empty_permitted
         self._errors = None  # Stores the errors after clean() has been called.
+        # cleaned_data is only populated during a (a)full_clean(); before
+        # that it raises AttributeError like a plain unset attribute.
+        self._cleaned_data = _UNSET
+        # State for an in-progress asynchronous validation round (ais_valid()).
+        # None when no async round is running.
+        self._async_validation = None
+        # Snapshot of the inputs used by the last completed validation round,
+        # and whether the last round was abandoned (all waiters cancelled).
+        self._validated_inputs = None
+        self._async_abandoned = False
 
         # The base_fields class attribute is the *class-wide* definition of
         # fields. Because a particular *instance* of the class might want to
@@ -197,13 +235,142 @@ class BaseForm(RenderableFormMixin):
     @property
     def errors(self):
         """Return an ErrorDict for the data provided for the form."""
+        # While an asynchronous validation round is in progress, only the
+        # task running the round itself may observe the (possibly partial)
+        # error collection. Every other caller gets a detached, empty
+        # ErrorDict instead of a half-finished or stale result.
+        state = self._async_validation
+        if state is not None and asyncio.current_task() is not state.runner_task:
+            return ErrorDict(renderer=self.renderer)
         if self._errors is None:
             self.full_clean()
         return self._errors
 
+    @property
+    def cleaned_data(self):
+        state = self._async_validation
+        if state is not None and asyncio.current_task() is not state.runner_task:
+            # Never expose partially populated data to code outside the
+            # task running the asynchronous validation round.
+            return {}
+        if self._cleaned_data is _UNSET:
+            raise AttributeError(
+                "'%s' object has no attribute 'cleaned_data'"
+                % self.__class__.__name__
+            )
+        return self._cleaned_data
+
+    @cleaned_data.setter
+    def cleaned_data(self, value):
+        self._cleaned_data = value
+
     def is_valid(self):
         """Return True if the form has no errors, or False otherwise."""
         return self.is_bound and not self.errors
+
+    async def ais_valid(self):
+        """
+        Async counterpart of is_valid().
+
+        Run the field and form cleaning pipeline asynchronously, awaiting
+        any awaitable results returned by field validators, ``clean_<field>``
+        hooks or the form-wide ``clean()`` hook. The business result, error
+        attribution and error format match the synchronous path.
+
+        Concurrent calls on the same form instance share a single cleaning
+        round: side-effectful validators run only once, and callers joining
+        later cannot change the inputs or outcome. If every waiting caller
+        is cancelled, the unfinished round is discarded (including its
+        temporary errors) and the next call performs a full retry.
+        """
+        state = self._async_validation
+        if state is None:
+            if self._can_reuse_validation():
+                return self.is_bound and not self._errors
+            state = self._start_async_validation()
+        state.waiters += 1
+        try:
+            await asyncio.shield(state.runner_task)
+        except asyncio.CancelledError:
+            state.waiters -= 1
+            if state.waiters == 0 and not state.finalized:
+                # Every waiter has given up: abandon the unfinished round
+                # synchronously so that a follow-up call starts a fresh one
+                # even if the runner task has not processed its cancellation
+                # yet.
+                self._abandon_async_validation(state)
+                state.runner_task.cancel()
+            raise
+        except BaseException:
+            state.waiters -= 1
+            raise
+        state.waiters -= 1
+        return self.is_bound and not self._errors
+
+    def _can_reuse_validation(self):
+        """Reuse a completed round when inputs are unchanged and the last
+        round was not abandoned by a wholesale cancellation."""
+        if self._async_abandoned or self._errors is None:
+            return False
+        snapshot = self._validated_inputs
+        return snapshot is not None and all(
+            current is original
+            for current, original in zip(
+                (self.data, self.files, self.initial),
+                snapshot,
+                strict=True,
+            )
+        )
+
+    def _start_async_validation(self):
+        loop = asyncio.get_running_loop()
+        state = _AsyncValidationState(
+            previous_errors=self._errors,
+            previous_cleaned_data=self._cleaned_data,
+            inputs=(self.data, self.files, self.initial),
+        )
+        self._async_validation = state
+        self._async_abandoned = False
+        # The runner installs fresh staging collections as its first step.
+        # Until then this task does not await anything, so the previous
+        # collections cannot be observed mid-transition by another task.
+        state.runner_task = loop.create_task(self._arun_async_validation(state))
+        return state
+
+    async def _arun_async_validation(self, state):
+        # The round may already have been abandoned synchronously (every
+        # waiter cancelled) before this task got its first step.
+        if state.finalized:
+            return
+        completed = False
+        try:
+            await self._afull_clean(state)
+            completed = True
+        finally:
+            # Finalization also runs if this task is cancelled before or
+            # while the cleaning coroutine runs. A round abandoned directly
+            # by the last waiter (or superseded by a newer round) is left
+            # untouched.
+            if self._async_validation is state and not state.finalized:
+                if completed:
+                    self._finish_async_validation(state)
+                else:
+                    self._abandon_async_validation(state)
+
+    def _finish_async_validation(self, state):
+        state.finalized = True
+        self._validated_inputs = state.inputs
+        self._async_abandoned = False
+        self._async_validation = None
+
+    def _abandon_async_validation(self, state):
+        state.finalized = True
+        # Drop the temporary, possibly partial collections and roll back to
+        # the last completed state. No failure is cached.
+        self._errors = state.previous_errors
+        self._cleaned_data = state.previous_cleaned_data
+        self._async_abandoned = True
+        self._async_validation = None
 
     def add_prefix(self, field_name):
         """
@@ -327,16 +494,23 @@ class BaseForm(RenderableFormMixin):
         """
         self._errors = ErrorDict(renderer=self.renderer)
         if not self.is_bound:  # Stop further processing.
+            self._record_validation_inputs()
             return
         self.cleaned_data = {}
         # If the form is permitted to be empty, and none of the form data has
         # changed from the initial data, short circuit any validation.
         if self.empty_permitted and not self.has_changed():
+            self._record_validation_inputs()
             return
 
         self._clean_fields()
         self._clean_form()
         self._post_clean()
+        self._record_validation_inputs()
+
+    def _record_validation_inputs(self):
+        self._validated_inputs = (self.data, self.files, self.initial)
+        self._async_abandoned = False
 
     def _clean_fields(self):
         for name, bf in self._bound_items():
@@ -349,6 +523,38 @@ class BaseForm(RenderableFormMixin):
             except ValidationError as e:
                 self.add_error(name, e)
 
+    def _async_raise_if_detached(self, state):
+        """Stop a runner whose round was abandoned or superseded.
+
+        A runner can keep running after cancellation if user code (a
+        validator or a clean hook) swallows CancelledError. Such a detached
+        runner must not write into the restored or newer form state, so it
+        is re-cancelled at the next pipeline boundary.
+        """
+        if state.finalized or self._async_validation is not state:
+            raise asyncio.CancelledError()
+
+    async def _aclean_fields(self, state):
+        for name, bf in self._bound_items():
+            self._async_raise_if_detached(state)
+            field = bf.field
+            try:
+                value = await field._aclean_bound_field(bf)
+                # The value is written to cleaned_data only after any
+                # awaitable field cleaning has resolved, so partial results
+                # never persist.
+                self._async_raise_if_detached(state)
+                self.cleaned_data[name] = value
+                if hasattr(self, "clean_%s" % name):
+                    hook = getattr(self, "clean_%s" % name)
+                    value = hook()
+                    if inspect.isawaitable(value):
+                        value = await value
+                        self._async_raise_if_detached(state)
+                    self.cleaned_data[name] = value
+            except ValidationError as e:
+                await self._aadd_error(name, e, state)
+
     def _clean_form(self):
         try:
             cleaned_data = self.clean()
@@ -357,6 +563,56 @@ class BaseForm(RenderableFormMixin):
         else:
             if cleaned_data is not None:
                 self.cleaned_data = cleaned_data
+
+    async def _aclean_form(self, state):
+        self._async_raise_if_detached(state)
+        try:
+            cleaned_data = self.clean()
+            if inspect.isawaitable(cleaned_data):
+                cleaned_data = await cleaned_data
+                self._async_raise_if_detached(state)
+        except ValidationError as e:
+            await self._aadd_error(None, e, state)
+        else:
+            if cleaned_data is not None:
+                self.cleaned_data = cleaned_data
+
+    async def _apost_clean(self, state):
+        """
+        Async counterpart of _post_clean(). The default hook is a no-op, as
+        on the synchronous path, and returns an awaitable result if a
+        subclass's _post_clean() happens to produce one.
+        """
+        result = self._post_clean()
+        if inspect.isawaitable(result):
+            await result
+            self._async_raise_if_detached(state)
+
+    async def _afull_clean(self, state):
+        """
+        Async counterpart of full_clean(). Field cleaning runs in
+        declaration order and the form-wide clean hook only reads field
+        results that have already completed.
+        """
+        self._errors = ErrorDict(renderer=self.renderer)
+        if not self.is_bound:  # Stop further processing.
+            return
+        self.cleaned_data = {}
+        # If the form is permitted to be empty, and none of the form data has
+        # changed from the initial data, short circuit any validation.
+        if self.empty_permitted and not self.has_changed():
+            return
+
+        await self._aclean_fields(state)
+        await self._aclean_form(state)
+        await self._apost_clean(state)
+
+    async def _aadd_error(self, field, error, state):
+        self._async_raise_if_detached(state)
+        result = self.add_error(field, error)
+        if inspect.isawaitable(result):
+            await result
+            self._async_raise_if_detached(state)
 
     def _post_clean(self):
         """
