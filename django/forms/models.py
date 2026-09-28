@@ -418,7 +418,7 @@ class BaseModelForm(BaseForm, AltersData):
 
             # Exclude fields that failed form validation. There's no need for
             # the model fields to validate them as well.
-            elif field in self._errors:
+            elif field in self.errors:
                 exclude.add(f.name)
 
             # Exclude empty fields that are not required by the form, if the

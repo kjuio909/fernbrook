@@ -644,6 +644,77 @@ class AsyncCacheInvalidationTests(SimpleTestCase):
         self.assertIs(await form.ais_valid(), True)
         self.assertEqual(form.cleaned_data["name"], "rebound")
 
+    async def test_changed_inputs_supersede_running_round(self):
+        old_gate = asyncio.Event()
+        new_gate = asyncio.Event()
+
+        class F(Form):
+            name = CharField()
+
+        async def gated_recording(value):
+            seen.append(value)
+            await old_gate.wait()
+
+        seen = []
+        form = F({"name": "old"})
+        form.fields["name"].validators.append(gated_recording)
+        old_task = asyncio.create_task(form.ais_valid())
+        await asyncio.sleep(0)
+
+        # Rebind the inputs while the first round is blocked, then call
+        # again: the new call abandons the stale snapshot and runs solely
+        # against the current inputs, without waiting for the old round.
+        form.data = {"name": "new"}
+
+        async def new_round():
+            async def recording(value):
+                seen.append(value)
+                await new_gate.wait()
+
+            form.fields["name"].validators = [recording]
+            return await form.ais_valid()
+
+        new_task = asyncio.create_task(new_round())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        # The new round already started cleaning the new snapshot even
+        # though the old round has not unblocked.
+        self.assertEqual(seen, ["old", "new"])
+        new_gate.set()
+        self.assertIs(await new_task, True)
+        self.assertEqual(form.cleaned_data, {"name": "new"})
+        # The stale round's waiter still gets its own snapshot's result.
+        old_gate.set()
+        self.assertIs(await old_task, True)
+        # The published result corresponds to the newest completed round.
+        self.assertEqual(form.cleaned_data, {"name": "new"})
+
+    async def test_previous_result_stays_visible_during_round(self):
+        gate = asyncio.Event()
+
+        class F(Form):
+            name = CharField()
+
+        form = F({"name": "done"})
+        self.assertIs(await form.ais_valid(), True)
+        self.assertEqual(form.cleaned_data, {"name": "done"})
+
+        async def gated_validator(value):
+            await gate.wait()
+
+        form.data = {"name": "in-flight"}
+        form.fields["name"].validators.append(gated_validator)
+        task = asyncio.create_task(form.ais_valid())
+        await asyncio.sleep(0)
+        # While the new round is unfinished, external reads keep observing
+        # the last complete result instead of a half-finished one.
+        self.assertEqual(form.cleaned_data, {"name": "done"})
+        self.assertEqual(dict(form.errors), {})
+        self.assertIs(form.is_valid(), True)
+        gate.set()
+        self.assertIs(await task, True)
+        self.assertEqual(form.cleaned_data, {"name": "in-flight"})
+
     async def test_running_round_uses_round_field_definitions(self):
         gate = asyncio.Event()
 
