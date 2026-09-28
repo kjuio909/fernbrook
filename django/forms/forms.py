@@ -12,7 +12,6 @@ from django.forms.fields import Field
 from django.forms.utils import ErrorDict, ErrorList, RenderableFormMixin
 from django.forms.widgets import Media, MediaDefiningClass
 from django.utils.datastructures import MultiValueDict
-from django.utils.functional import cached_property
 from django.utils.translation import gettext as _
 
 from .renderers import get_default_renderer
@@ -22,6 +21,31 @@ __all__ = ("BaseForm", "Form")
 # Marker for "cleaned_data was never populated" (accessing it raises
 # AttributeError, as on a form that has never been validated).
 _UNSET = object()
+
+
+def _snapshot_mapping(mapping):
+    """Return a detached shallow copy of a bound data/files mapping.
+
+    ``MultiValueDict`` copies keep their multi-value semantics; the mapping
+    setters replace per-key value lists rather than mutating them, so data
+    rebound or changed after the snapshot was taken cannot reach the copy.
+    Plain mappings are copied with ``dict()``.
+    """
+    if isinstance(mapping, MultiValueDict):
+        return copy.copy(mapping)
+    return dict(mapping)
+
+
+def _mapping_fingerprint(mapping):
+    """Build a value-based, order-preserving fingerprint of a mapping.
+
+    Equality compares the contained values (``==``), so in-place mutations of
+    bound data invalidate a cached validation round even when the mapping
+    object's identity is unchanged.
+    """
+    if isinstance(mapping, MultiValueDict):
+        return tuple((key, tuple(values)) for key, values in mapping.lists())
+    return tuple((key, mapping[key]) for key in mapping)
 
 
 class DeclarativeFieldsMetaclass(MediaDefiningClass):
@@ -63,18 +87,35 @@ class _AsyncValidationState:
     round.
     """
 
-    def __init__(self, *, previous_errors, previous_cleaned_data, inputs):
+    def __init__(self, *, is_bound, inputs, fields, fingerprint):
         self.runner_task = None
         # Number of ais_valid() callers currently awaiting the runner task.
         self.waiters = 0
         # Set once the round has either completed or been abandoned.
         self.finalized = False
-        # State to restore if the round is abandoned because every waiter
-        # was cancelled.
-        self.previous_errors = previous_errors
-        self.previous_cleaned_data = previous_cleaned_data
-        # Identity snapshot of (data, files, initial) the round is cleaning.
-        self.inputs = inputs
+        # Whether the form was bound when the round started.
+        self.is_bound = is_bound
+        # Detached snapshots the round cleans against. Inputs rebound or
+        # mutated after the round started never reach the runner.
+        self.data = inputs[0]
+        self.files = inputs[1]
+        self.initial = inputs[2]
+        self.fields = fields
+        # BoundField objects private to the runner task; lazily cached
+        # values (initial, subwidgets) are computed against the snapshot.
+        self.bound_fields_cache = {}
+        # Value-based fingerprint of the snapshot, used to decide whether a
+        # later call can reuse the completed result.
+        self.fingerprint = fingerprint
+        # The last successfully completed state to roll back to if this
+        # round is abandoned or dies on a non-ValidationError exception.
+        self.previous_errors = None
+        self.previous_cleaned_data = _UNSET
+        # The business result of a completed round, shared with every waiter
+        # so callers observe one identical conclusion even if the form is
+        # re-validated or reset between the runner finishing and the waiters
+        # resuming.
+        self.result = None
 
 
 class BaseForm(RenderableFormMixin):
@@ -114,12 +155,12 @@ class BaseForm(RenderableFormMixin):
         bound_field_class=None,
     ):
         self.is_bound = data is not None or files is not None
-        self.data = MultiValueDict() if data is None else data
-        self.files = MultiValueDict() if files is None else files
+        self._data = MultiValueDict() if data is None else data
+        self._files = MultiValueDict() if files is None else files
         self.auto_id = auto_id
         if prefix is not None:
             self.prefix = prefix
-        self.initial = initial or {}
+        self._initial = initial or {}
         self.error_class = error_class
         # Translators: This is the default suffix added to form field labels
         self.label_suffix = label_suffix if label_suffix is not None else _(":")
@@ -131,17 +172,16 @@ class BaseForm(RenderableFormMixin):
         # State for an in-progress asynchronous validation round (ais_valid()).
         # None when no async round is running.
         self._async_validation = None
-        # Snapshot of the inputs used by the last completed validation round,
-        # and whether the last round was abandoned (all waiters cancelled).
-        self._validated_inputs = None
-        self._async_abandoned = False
+        # Fingerprint of the inputs/field definitions used by the last
+        # successfully completed validation round, for reuse checks.
+        self._validation_fingerprint = None
 
         # The base_fields class attribute is the *class-wide* definition of
         # fields. Because a particular *instance* of the class might want to
         # alter self.fields, we create self.fields here by copying base_fields.
         # Instances should always modify self.fields; they should not modify
         # self.base_fields.
-        self.fields = copy.deepcopy(self.base_fields)
+        self._fields = copy.deepcopy(self.base_fields)
         self._bound_fields_cache = {}
         self.order_fields(self.field_order if field_order is None else field_order)
 
@@ -217,20 +257,76 @@ class BaseForm(RenderableFormMixin):
 
     def __getitem__(self, name):
         """Return a BoundField with the given name."""
+        state = self._async_validation
+        if state is not None and asyncio.current_task() is state.runner_task:
+            # The runner uses its own BoundField objects so lazily cached
+            # values computed against the round snapshot never leak onto the
+            # BoundFields shared with the outside world.
+            cache = state.bound_fields_cache
+            fields = state.fields
+        else:
+            cache = self._bound_fields_cache
+            fields = self._fields
         try:
-            field = self.fields[name]
+            field = fields[name]
         except KeyError:
             raise KeyError(
                 "Key '%s' not found in '%s'. Choices are: %s."
                 % (
                     name,
                     self.__class__.__name__,
-                    ", ".join(sorted(self.fields)),
+                    ", ".join(sorted(fields)),
                 )
             )
-        if name not in self._bound_fields_cache:
-            self._bound_fields_cache[name] = field.get_bound_field(self, name)
-        return self._bound_fields_cache[name]
+        if name not in cache:
+            cache[name] = field.get_bound_field(self, name)
+        return cache[name]
+
+    @property
+    def data(self):
+        # The task running an asynchronous round reads from its detached
+        # snapshot; everyone else reads the live bound data.
+        state = self._async_validation
+        if state is not None and asyncio.current_task() is state.runner_task:
+            return state.data
+        return self._data
+
+    @data.setter
+    def data(self, value):
+        self._data = value
+
+    @property
+    def files(self):
+        state = self._async_validation
+        if state is not None and asyncio.current_task() is state.runner_task:
+            return state.files
+        return self._files
+
+    @files.setter
+    def files(self, value):
+        self._files = value
+
+    @property
+    def initial(self):
+        state = self._async_validation
+        if state is not None and asyncio.current_task() is state.runner_task:
+            return state.initial
+        return self._initial
+
+    @initial.setter
+    def initial(self, value):
+        self._initial = value
+
+    @property
+    def fields(self):
+        state = self._async_validation
+        if state is not None and asyncio.current_task() is state.runner_task:
+            return state.fields
+        return self._fields
+
+    @fields.setter
+    def fields(self, value):
+        self._fields = value
 
     @property
     def errors(self):
@@ -305,37 +401,163 @@ class BaseForm(RenderableFormMixin):
             state.waiters -= 1
             raise
         state.waiters -= 1
-        return self.is_bound and not self._errors
+        # Return the round's own conclusion rather than re-reading the live
+        # form state: the form may have been re-validated or reset between
+        # the runner finishing and this waiter resuming.
+        return state.result
+
+    def _validation_inputs(self):
+        """The live (data, files, initial) a new round would clean."""
+        return (self._data, self._files, self._initial)
+
+    def _snapshot_validation_inputs(self):
+        """Detached shallow copies of the live bound inputs."""
+        data, files, initial = self._validation_inputs()
+        return (
+            _snapshot_mapping(data),
+            _snapshot_mapping(files),
+            dict(initial),
+        )
+
+    def _clone_field(self, field):
+        """Detach a field definition without detaching its validators.
+
+        The field object is shallow-copied and its mutable definition
+        containers (validators, choices, error messages, widget, nested
+        subfields) are copied, so reconfiguring the live field while a round
+        is in progress cannot reach the runner. Validator callables -- which
+        may be bound methods of the live form -- keep their identity.
+        """
+        clone = copy.copy(field)
+        for attr, value in list(vars(clone).items()):
+            if attr == "widget":
+                clone.widget = copy.deepcopy(value)
+            elif (
+                attr == "fields"
+                and isinstance(value, (list, tuple))
+                and value
+                and all(isinstance(sub, Field) for sub in value)
+            ):
+                cloned = [self._clone_field(sub) for sub in value]
+                clone.fields = tuple(cloned) if isinstance(value, tuple) else cloned
+            elif isinstance(value, list):
+                setattr(clone, attr, list(value))
+            elif isinstance(value, dict):
+                setattr(clone, attr, dict(value))
+            elif isinstance(value, set):
+                setattr(clone, attr, set(value))
+        return clone
+
+    def _snapshot_fields(self):
+        """A detached copy of the field definitions for an async round.
+
+        Fields added, removed, replaced or reconfigured after the round
+        starts -- validators appended to a field, choices mutated in place or
+        a toggled ``required`` flag -- cannot reach the runner.
+        """
+        return {name: self._clone_field(field) for name, field in self._fields.items()}
+
+    def _freeze_fingerprint_value(self, value):
+        """Return an immutable snapshot of a fingerprint component.
+
+        Mutable containers are copied so later in-place mutations (e.g.
+        appending a validator or updating choices) change the live objects
+        without retroactively changing the stored fingerprint.
+        """
+        if isinstance(value, (list, tuple)):
+            return tuple(self._freeze_fingerprint_value(item) for item in value)
+        if isinstance(value, set):
+            return frozenset(self._freeze_fingerprint_value(item) for item in value)
+        if isinstance(value, dict):
+            return tuple(
+                (key, self._freeze_fingerprint_value(item))
+                for key, item in sorted(value.items(), key=lambda item: str(item[0]))
+            )
+        return value
+
+    def _field_fingerprint(self, field):
+        """Structural fingerprint of a field definition.
+
+        Covers every instance attribute (validators, error messages,
+        choices, input formats, coercion callables, subfields and so on) so
+        that configuration changes invalidate a cached round. Mutable
+        attributes are snapshotted; plain callables compare by identity.
+        Nested subfields (ComboField / MultiValueField) and the widget are
+        fingerprinted recursively.
+        """
+        items = []
+        for key, value in vars(field).items():
+            if (
+                key == "fields"
+                and isinstance(value, (list, tuple))
+                and value
+                and all(isinstance(sub, Field) for sub in value)
+            ):
+                value = tuple(self._field_fingerprint(sub) for sub in value)
+            elif key == "widget":
+                value = (
+                    type(value),
+                    self._freeze_fingerprint_value(vars(value)),
+                )
+            else:
+                value = self._freeze_fingerprint_value(value)
+            items.append((key, value))
+        return tuple(sorted(items, key=lambda item: item[0]))
+
+    def _fields_fingerprint(self, fields):
+        return tuple(
+            (name, self._field_fingerprint(field))
+            for name, field in fields.items()
+        )
+
+    def _current_validation_fingerprint(self):
+        """Fingerprint of the live inputs and the live field definitions."""
+        data, files, initial = self._validation_inputs()
+        return (
+            _mapping_fingerprint(data),
+            _mapping_fingerprint(files),
+            tuple(sorted(initial.items(), key=lambda item: str(item[0]))),
+            self._fields_fingerprint(self._fields),
+        )
 
     def _can_reuse_validation(self):
-        """Reuse a completed round when inputs are unchanged and the last
-        round was not abandoned by a wholesale cancellation."""
-        if self._async_abandoned or self._errors is None:
+        """Reuse a completed round when its fingerprint still matches."""
+        if self._errors is None or self._validation_fingerprint is None:
             return False
-        snapshot = self._validated_inputs
-        return snapshot is not None and all(
-            current is original
-            for current, original in zip(
-                (self.data, self.files, self.initial),
-                snapshot,
-                strict=True,
-            )
-        )
+        return self._current_validation_fingerprint() == self._validation_fingerprint
 
     def _start_async_validation(self):
         loop = asyncio.get_running_loop()
+        inputs = self._snapshot_validation_inputs()
+        fields = self._snapshot_fields()
         state = _AsyncValidationState(
-            previous_errors=self._errors,
-            previous_cleaned_data=self._cleaned_data,
-            inputs=(self.data, self.files, self.initial),
+            is_bound=self.is_bound,
+            inputs=inputs,
+            fields=fields,
+            fingerprint=self._build_snapshot_fingerprint(inputs, fields),
         )
+        # Capture the last successfully completed state so it can be
+        # restored if this round is abandoned; a fresh form captures the
+        # never-validated state (None / _UNSET).
+        state.previous_errors = self._errors
+        state.previous_cleaned_data = self._cleaned_data
         self._async_validation = state
-        self._async_abandoned = False
         # The runner installs fresh staging collections as its first step.
         # Until then this task does not await anything, so the previous
         # collections cannot be observed mid-transition by another task.
         state.runner_task = loop.create_task(self._arun_async_validation(state))
         return state
+
+    def _build_snapshot_fingerprint(self, inputs, fields):
+        """Fingerprint matching _current_validation_fingerprint() for a
+        detached round snapshot."""
+        data, files, initial = inputs
+        return (
+            _mapping_fingerprint(data),
+            _mapping_fingerprint(files),
+            tuple(sorted(initial.items(), key=lambda item: str(item[0]))),
+            self._fields_fingerprint(fields),
+        )
 
     async def _arun_async_validation(self, state):
         # The round may already have been abandoned synchronously (every
@@ -359,17 +581,21 @@ class BaseForm(RenderableFormMixin):
 
     def _finish_async_validation(self, state):
         state.finalized = True
-        self._validated_inputs = state.inputs
-        self._async_abandoned = False
+        state.result = state.is_bound and not self._errors
+        self._validation_fingerprint = state.fingerprint
         self._async_validation = None
 
     def _abandon_async_validation(self, state):
         state.finalized = True
-        # Drop the temporary, possibly partial collections and roll back to
-        # the last completed state. No failure is cached.
+        state.result = False
+        # Discard the temporary, possibly partial collections of this round
+        # and expose the last successfully completed result (or the
+        # never-validated state on a fresh form). No conclusion of this
+        # round is cached: the fingerprint is cleared so the next call
+        # performs a complete retry against the current inputs.
         self._errors = state.previous_errors
         self._cleaned_data = state.previous_cleaned_data
-        self._async_abandoned = True
+        self._validation_fingerprint = None
         self._async_validation = None
 
     def add_prefix(self, field_name):
@@ -494,23 +720,24 @@ class BaseForm(RenderableFormMixin):
         """
         self._errors = ErrorDict(renderer=self.renderer)
         if not self.is_bound:  # Stop further processing.
-            self._record_validation_inputs()
+            self._record_validation_fingerprint()
             return
         self.cleaned_data = {}
         # If the form is permitted to be empty, and none of the form data has
         # changed from the initial data, short circuit any validation.
         if self.empty_permitted and not self.has_changed():
-            self._record_validation_inputs()
+            self._record_validation_fingerprint()
             return
 
         self._clean_fields()
         self._clean_form()
         self._post_clean()
-        self._record_validation_inputs()
+        self._record_validation_fingerprint()
 
-    def _record_validation_inputs(self):
-        self._validated_inputs = (self.data, self.files, self.initial)
-        self._async_abandoned = False
+    def _record_validation_fingerprint(self):
+        # The synchronous path never consults the fingerprint itself (it
+        # always re-runs), but it lets a later ais_valid() reuse the result.
+        self._validation_fingerprint = self._current_validation_fingerprint()
 
     def _clean_fields(self):
         for name, bf in self._bound_items():
@@ -595,7 +822,7 @@ class BaseForm(RenderableFormMixin):
         results that have already completed.
         """
         self._errors = ErrorDict(renderer=self.renderer)
-        if not self.is_bound:  # Stop further processing.
+        if not state.is_bound:  # Stop further processing.
             return
         self.cleaned_data = {}
         # If the form is permitted to be empty, and none of the form data has
@@ -634,9 +861,28 @@ class BaseForm(RenderableFormMixin):
         """Return True if data differs from initial."""
         return bool(self.changed_data)
 
-    @cached_property
+    @property
     def changed_data(self):
-        return [name for name, bf in self._bound_items() if bf._has_changed()]
+        state = self._async_validation
+        if state is not None and asyncio.current_task() is state.runner_task:
+            # Compute from the round snapshot without populating the shared
+            # cache, which must stay tied to the live inputs.
+            return [name for name, bf in self._bound_items() if bf._has_changed()]
+        try:
+            return self.__dict__["changed_data"]
+        except KeyError:
+            value = [name for name, bf in self._bound_items() if bf._has_changed()]
+            self.__dict__["changed_data"] = value
+            return value
+
+    @changed_data.setter
+    def changed_data(self, value):
+        # Preserve cached_property's writable-instance-dict semantics.
+        self.__dict__["changed_data"] = value
+
+    @changed_data.deleter
+    def changed_data(self):
+        self.__dict__.pop("changed_data", None)
 
     @property
     def media(self):
