@@ -124,6 +124,10 @@ class _AsyncValidationState:
         # readers never observe a half-finished result.
         self.errors = None
         self.cleaned_data = _UNSET
+        # Changed-field list computed against the round snapshot, published
+        # atomically with errors/cleaned_data. None until the runner decides
+        # the empty-submission question.
+        self.changed_data = None
         # The business result of a completed round, shared with every waiter
         # so callers observe one identical conclusion even if the form is
         # re-validated or reset between the runner finishing and the waiters
@@ -655,6 +659,7 @@ class BaseForm(RenderableFormMixin):
             # Atomically publish this round's staging as the form result.
             self._errors = state.errors
             self._cleaned_data = state.cleaned_data
+            self.__dict__["changed_data"] = state.changed_data
             self._validation_fingerprint = state.fingerprint
             self._async_validation = None
         # A detached (superseded) round keeps its conclusion only to serve
@@ -806,6 +811,11 @@ class BaseForm(RenderableFormMixin):
         for state in self._async_rounds:
             state.detached = True
         self._async_validation = None
+        # A previous round (sync or async) may have cached changed_data for a
+        # different snapshot. The empty-submission decision below must be made
+        # against the current live inputs, so drop the stale cache; it is
+        # lazily recomputed.
+        self.__dict__.pop("changed_data", None)
         self._errors = ErrorDict(renderer=self.renderer)
         if not self.is_bound:  # Stop further processing.
             self._record_validation_fingerprint()
@@ -915,6 +925,12 @@ class BaseForm(RenderableFormMixin):
         # Fresh private staging for this round; the previously published
         # collections stay untouched until the round finishes.
         state.errors = ErrorDict(renderer=self.renderer)
+        # Compute changed_data against the round snapshot once: the
+        # empty-submission decision below and the atomic publish at the end
+        # of the round are both based on this same value.
+        state.changed_data = [
+            name for name, bf in self._bound_items() if bf._has_changed()
+        ]
         if not state.is_bound:  # Stop further processing.
             return
         self.cleaned_data = {}
@@ -956,21 +972,38 @@ class BaseForm(RenderableFormMixin):
 
     @property
     def changed_data(self):
-        if self._current_async_state() is not None:
-            # Compute from the round snapshot without populating the shared
-            # cache, which must stay tied to the live inputs.
-            return [name for name, bf in self._bound_items() if bf._has_changed()]
+        state = self._current_async_state()
+        if state is not None:
+            # Compute from the round snapshot and keep it on the round: it is
+            # the value both the empty-submission decision and the atomic
+            # publish are based on, and it must never populate the cache
+            # shared with outside readers.
+            if state.changed_data is None:
+                state.changed_data = [
+                    name for name, bf in self._bound_items() if bf._has_changed()
+                ]
+            return state.changed_data
         try:
             return self.__dict__["changed_data"]
         except KeyError:
             value = [name for name, bf in self._bound_items() if bf._has_changed()]
-            self.__dict__["changed_data"] = value
+            # While an async round is in flight on a form that has never
+            # published a result, don't cache a list derived from the live
+            # inputs: the round may be discarded without publishing, leaving
+            # a stale list behind. The round's own publish is what populates
+            # the cache.
+            if not self._async_rounds:
+                self.__dict__["changed_data"] = value
             return value
 
     @changed_data.setter
     def changed_data(self, value):
         # Preserve cached_property's writable-instance-dict semantics.
-        self.__dict__["changed_data"] = value
+        state = self._current_async_state()
+        if state is not None:
+            state.changed_data = value
+        else:
+            self.__dict__["changed_data"] = value
 
     @changed_data.deleter
     def changed_data(self):

@@ -287,6 +287,172 @@ class AsyncIsValidTests(SimpleTestCase):
         self.assertIs(await form.ais_valid(), True)
         self.assertEqual(dict(form.errors), {})
 
+    async def test_empty_permitted_unchanged_matches_sync(self):
+        calls = []
+
+        class F(Form):
+            name = CharField()
+
+            def counting_validator(self, value):
+                calls.append("validator")
+
+            def clean_name(self):
+                calls.append("clean_name")
+                return self.cleaned_data["name"]
+
+            def clean(self):
+                calls.append("clean")
+                return self.cleaned_data
+
+        sync_form = F(
+            {"name": "x"},
+            initial={"name": "x"},
+            empty_permitted=True,
+            use_required_attribute=False,
+        )
+        sync_form.fields["name"].validators.append(sync_form.counting_validator)
+        self.assertIs(sync_form.is_valid(), True)
+
+        form = F(
+            {"name": "x"},
+            initial={"name": "x"},
+            empty_permitted=True,
+            use_required_attribute=False,
+        )
+        form.fields["name"].validators.append(form.counting_validator)
+        self.assertIs(await form.ais_valid(), True)
+        # No field/form validation ran, on either path.
+        self.assertEqual(calls, [])
+        # No errors, empty cleaned_data and changed_data, identical to sync.
+        self.assertEqual(dict(form.errors), {})
+        self.assertEqual(form.errors.as_json(), sync_form.errors.as_json())
+        self.assertEqual(form.cleaned_data, {})
+        self.assertEqual(form.changed_data, [])
+
+    async def test_empty_permitted_empty_string_change_runs_full_clean(self):
+        sync_form = SimplePersonForm(
+            {"first_name": "", "last_name": ""},
+            initial={"first_name": "x", "last_name": "x"},
+            empty_permitted=True,
+            use_required_attribute=False,
+        )
+        self.assertIs(sync_form.is_valid(), False)
+        form = SimplePersonForm(
+            {"first_name": "", "last_name": ""},
+            initial={"first_name": "x", "last_name": "x"},
+            empty_permitted=True,
+            use_required_attribute=False,
+        )
+        self.assertIs(await form.ais_valid(), False)
+        # A change -- even to an empty string -- exits the short circuit and
+        # produces the full synchronous result.
+        self.assertEqual(form.errors.as_json(), sync_form.errors.as_json())
+        self.assertEqual(form.changed_data, ["first_name", "last_name"])
+
+    async def test_empty_permitted_whitespace_change_runs_full_clean(self):
+        class F(Form):
+            name = CharField()
+
+        sync_form = F(
+            {"name": "   "},
+            initial={"name": "x"},
+            empty_permitted=True,
+            use_required_attribute=False,
+        )
+        self.assertIs(sync_form.is_valid(), False)
+        form = F(
+            {"name": "   "},
+            initial={"name": "x"},
+            empty_permitted=True,
+            use_required_attribute=False,
+        )
+        self.assertIs(await form.ais_valid(), False)
+        self.assertEqual(form.errors.as_json(), sync_form.errors.as_json())
+        self.assertEqual(form.changed_data, ["name"])
+
+    async def test_unbound_empty_permitted_does_not_short_circuit(self):
+        form = SimplePersonForm(
+            initial={"first_name": "John", "last_name": "Lennon"},
+            empty_permitted=True,
+            use_required_attribute=False,
+        )
+        self.assertIs(await form.ais_valid(), False)
+        self.assertEqual(dict(form.errors), {})
+
+    async def test_changed_data_published_with_round_result(self):
+        class F(Form):
+            name = CharField()
+
+        form = F(
+            {"name": "a"},
+            empty_permitted=True,
+            use_required_attribute=False,
+        )
+        self.assertIs(await form.ais_valid(), True)
+        # Populate the cached changed_data for the first snapshot.
+        self.assertEqual(form.changed_data, ["name"])
+
+        # Rebind to an unchanged submission (relative to new initial): the
+        # short-circuit conclusion and its changed_data are published together.
+        form.data = {"name": "x"}
+        form.initial = {"name": "x"}
+        self.assertIs(await form.ais_valid(), True)
+        self.assertEqual(form.changed_data, [])
+
+        # Posting an empty value that differs from the initial exits the
+        # short circuit on the next round, which again publishes matching
+        # changed_data and fails on the required field.
+        form.data = {"name": ""}
+        self.assertIs(await form.ais_valid(), False)
+        self.assertEqual(form.changed_data, ["name"])
+        self.assertIn("required", form.errors.as_json())
+
+    async def test_sync_empty_short_circuit_reused_by_async(self):
+        class F(Form):
+            name = CharField()
+
+            def __init__(self, *args, **kwargs):
+                self.calls = 0
+                super().__init__(*args, **kwargs)
+
+            def counting_validator(self, value):
+                self.calls += 1
+
+        form = F(
+            {"name": "x"},
+            initial={"name": "x"},
+            empty_permitted=True,
+            use_required_attribute=False,
+        )
+        form.fields["name"].validators.append(form.counting_validator)
+        self.assertIs(form.is_valid(), True)
+        self.assertEqual(form.cleaned_data, {})
+        self.assertIs(await form.ais_valid(), True)
+        self.assertEqual(form.calls, 0)
+
+    async def test_async_empty_short_circuit_reused_by_sync(self):
+        class F(Form):
+            name = CharField()
+
+            def __init__(self, *args, **kwargs):
+                self.calls = 0
+                super().__init__(*args, **kwargs)
+
+            def counting_validator(self, value):
+                self.calls += 1
+
+        form = F(
+            {"name": "x"},
+            initial={"name": "x"},
+            empty_permitted=True,
+            use_required_attribute=False,
+        )
+        form.fields["name"].validators.append(form.counting_validator)
+        self.assertIs(await form.ais_valid(), True)
+        self.assertIs(form.is_valid(), True)
+        self.assertEqual(form.calls, 0)
+        self.assertEqual(form.changed_data, [])
+
 
 class AsyncFieldTypesTests(SimpleTestCase):
     async def test_combo_field(self):
@@ -495,6 +661,146 @@ class AsyncConcurrencyTests(SimpleTestCase):
         with self.assertRaises(RuntimeError):
             await form.ais_valid()
         self.assertEqual(F.calls, 2)
+
+    async def test_empty_submission_supersedes_blocked_round(self):
+        started = asyncio.Event()
+        gate = asyncio.Event()
+        events = []
+
+        class F(Form):
+            name = CharField(required=False)
+
+            async def gated_validator(self, value):
+                events.append("start")
+                started.set()
+                await gate.wait()
+                events.append("end")
+
+        # The first round is a real (changed-data) validation that blocks in
+        # its validator.
+        form = F(
+            {"name": "new"},
+            initial={"name": "init"},
+            empty_permitted=True,
+            use_required_attribute=False,
+        )
+        form.fields["name"].validators.append(form.gated_validator)
+        old_task = asyncio.create_task(form.ais_valid())
+        await started.wait()
+
+        # Rebind to an unchanged submission: the new round decides
+        # empty-submission against the new snapshot and publishes immediately,
+        # without waiting for the blocked round.
+        form.data = {"name": "init"}
+        form.initial = {"name": "init"}
+        new_task = asyncio.create_task(form.ais_valid())
+        self.assertIs(await new_task, True)
+        self.assertEqual(dict(form.errors), {})
+        self.assertEqual(form.cleaned_data, {})
+        self.assertEqual(form.changed_data, [])
+
+        # The old round finishes on its own snapshot but cannot overwrite the
+        # published empty-submission result.
+        gate.set()
+        self.assertIs(await old_task, True)
+        self.assertEqual(dict(form.errors), {})
+        self.assertEqual(form.cleaned_data, {})
+        self.assertEqual(form.changed_data, [])
+        self.assertEqual(events, ["start", "end"])
+
+    async def test_cancel_all_then_empty_submission_short_circuits(self):
+        gate = asyncio.Event()
+
+        class F(Form):
+            name = CharField(required=False)
+
+            async def gated_validator(self, value):
+                await gate.wait()
+
+        form = F(
+            {"name": "new"},
+            initial={"name": "init"},
+            empty_permitted=True,
+            use_required_attribute=False,
+        )
+        form.fields["name"].validators.append(form.gated_validator)
+        task = asyncio.create_task(form.ais_valid())
+        await asyncio.sleep(0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.05)
+
+        # Make the inputs an unchanged submission: the next call reaches the
+        # empty-submission short circuit even though the abandoned runner
+        # task has not unblocked yet.
+        form.data = {"name": "init"}
+        form.initial = {"name": "init"}
+        self.assertIs(await form.ais_valid(), True)
+        self.assertEqual(form.cleaned_data, {})
+        self.assertEqual(form.changed_data, [])
+        # Let the abandoned task finish to keep the loop clean.
+        gate.set()
+        await asyncio.sleep(0.05)
+
+    async def test_cancelled_failed_round_publishes_nothing(self):
+        gate = asyncio.Event()
+
+        class F(Form):
+            name = CharField(required=False)
+
+            async def gated_fail(self, value):
+                await gate.wait()
+                raise ValidationError("late-bad")
+
+        form = F(
+            {"name": "y"},
+            initial={"name": "x"},
+            empty_permitted=True,
+            use_required_attribute=False,
+        )
+        form.fields["name"].validators.append(form.gated_fail)
+        task = asyncio.create_task(form.ais_valid())
+        await asyncio.sleep(0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.05)
+        gate.set()
+        await asyncio.sleep(0.05)
+        # The cancelled round leaves no reusable conclusion; the next call
+        # performs a complete validation.
+        self.assertIsNone(form._errors)
+        self.assertIs(await form.ais_valid(), False)
+        self.assertIn("late-bad", str(form.errors["name"]))
+
+    async def test_changed_data_stays_published_during_round(self):
+        gate = asyncio.Event()
+
+        class F(Form):
+            name = CharField(required=False)
+
+            async def gated_validator(self, value):
+                await gate.wait()
+
+        form = F({"name": "a"})
+        self.assertIs(await form.ais_valid(), True)
+        self.assertEqual(form.changed_data, ["name"])
+
+        form.data = {"name": "b"}
+        form.fields["name"].validators.append(form.gated_validator)
+        task = asyncio.create_task(form.ais_valid())
+        await asyncio.sleep(0)
+        try:
+            # External reads while the round is unfinished keep observing the
+            # last published result rather than round internals.
+            self.assertEqual(form.changed_data, ["name"])
+            self.assertEqual(dict(form.errors), {})
+            self.assertEqual(form.cleaned_data, {"name": "a"})
+        finally:
+            gate.set()
+            await task
+        self.assertEqual(form.changed_data, ["name"])
 
 
 class AsyncChoiceFieldTests(SimpleTestCase):
@@ -814,7 +1120,7 @@ class AsyncCancellationStateTests(SimpleTestCase):
 
 
 class AsyncSyncInterleaveTests(SimpleTestCase):
-    def _make_form(self, *, fail=False):
+    def _make_form(self, *, fail=False, empty_permitted=False):
         started = asyncio.Event()
         gate = asyncio.Event()
 
@@ -838,7 +1144,11 @@ class AsyncSyncInterleaveTests(SimpleTestCase):
 
                     return wait()
 
-        form = F({"name": "old"})
+        form = F(
+            {"name": "old"},
+            empty_permitted=empty_permitted,
+            use_required_attribute=False,
+        )
         form.fields["name"].validators.append(form.gated_validator)
         return form, started, gate
 
@@ -897,4 +1207,30 @@ class AsyncSyncInterleaveTests(SimpleTestCase):
         await asyncio.sleep(0.05)
         self.assertIs(await form.ais_valid(), True)
         self.assertEqual(form.cleaned_data, {"name": "old"})
+
+    async def test_late_async_round_does_not_overwrite_sync_empty_result(self):
+        form, started, gate = self._make_form(empty_permitted=True)
+        task = asyncio.create_task(form.ais_valid())
+        await started.wait()
+        # The inputs become an unchanged submission, and the synchronous path
+        # publishes the empty-submission result while the async round is
+        # blocked.
+        form.data = {"name": "same"}
+        form.initial = {"name": "same"}
+        form.block = False
+        form.full_clean()
+        self.assertEqual(form.cleaned_data, {})
+        self.assertEqual(form.changed_data, [])
+
+        gate.set()
+        self.assertIs(await task, True)
+        # The late async completion must not replace the synchronous
+        # empty-submission conclusion.
+        self.assertEqual(form.cleaned_data, {})
+        self.assertEqual(form.changed_data, [])
+        self.assertEqual(dict(form.errors), {})
+        # The synchronous empty result is reusable without a new round.
+        self.assertIs(await form.ais_valid(), True)
+        self.assertEqual(form.cleaned_data, {})
+        self.assertEqual(form.changed_data, [])
 
