@@ -333,10 +333,14 @@ class BaseForm(RenderableFormMixin):
         """Return an ErrorDict for the data provided for the form."""
         # While an asynchronous validation round is in progress, only the
         # task running the round itself may observe the (possibly partial)
-        # error collection. Every other caller gets a detached, empty
-        # ErrorDict instead of a half-finished or stale result.
+        # error collection. Every other caller sees the last successfully
+        # completed result (which stays visible until the new round replaces
+        # it atomically), or a detached, empty ErrorDict on a form that has
+        # never completed a round, instead of a half-finished one.
         state = self._async_validation
         if state is not None and asyncio.current_task() is not state.runner_task:
+            if state.previous_errors is not None:
+                return state.previous_errors
             return ErrorDict(renderer=self.renderer)
         if self._errors is None:
             self.full_clean()
@@ -347,7 +351,10 @@ class BaseForm(RenderableFormMixin):
         state = self._async_validation
         if state is not None and asyncio.current_task() is not state.runner_task:
             # Never expose partially populated data to code outside the
-            # task running the asynchronous validation round.
+            # task running the asynchronous validation round. Keep serving
+            # the last completed round's data until the new round finishes.
+            if state.previous_cleaned_data is not _UNSET:
+                return state.previous_cleaned_data
             return {}
         if self._cleaned_data is _UNSET:
             raise AttributeError(

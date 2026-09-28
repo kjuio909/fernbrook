@@ -1,6 +1,6 @@
 import asyncio
 
-from django.core.exceptions import ValidationError
+from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.forms import (
     BooleanField,
@@ -188,6 +188,49 @@ class AsyncIsValidTests(SimpleTestCase):
         form = F({"name": "x"})
         self.assertIs(await form.ais_valid(), False)
         self.assertIn("form-wide", str(form.non_field_errors()))
+
+    async def test_field_and_nonfield_errors_keep_attribution_and_order(self):
+        def fail(message):
+            def validator(value):
+                raise ValidationError(message)
+
+            return validator
+
+        class F(Form):
+            first = CharField()
+            second = CharField()
+
+            async def clean(self):
+                await asyncio.sleep(0)
+                raise ValidationError("form-wide")
+
+        class SyncF(Form):
+            first = CharField()
+            second = CharField()
+
+            def clean(self):
+                raise ValidationError("form-wide")
+
+        form = F({"first": "a", "second": "b"})
+        form.fields["first"].validators.append(fail("first-bad"))
+        form.fields["second"].validators.append(fail("second-bad"))
+        self.assertIs(await form.ais_valid(), False)
+        # Field errors stay attributed to their fields in declaration order
+        # and the form-wide error stays a non-field error.
+        self.assertEqual(
+            list(form.errors.keys()), ["first", "second", NON_FIELD_ERRORS]
+        )
+        self.assertIn("first-bad", str(form.errors["first"]))
+        self.assertIn("second-bad", str(form.errors["second"]))
+        self.assertIn("form-wide", str(form.errors[NON_FIELD_ERRORS]))
+        self.assertNotIn("first", form.cleaned_data)
+        self.assertNotIn("second", form.cleaned_data)
+        # Parity with the synchronous path.
+        sync_form = SyncF({"first": "a", "second": "b"})
+        sync_form.fields["first"].validators.append(fail("first-bad"))
+        sync_form.fields["second"].validators.append(fail("second-bad"))
+        sync_form.is_valid()
+        self.assertEqual(form.errors.as_json(), sync_form.errors.as_json())
 
     async def test_async_form_clean_replaces_cleaned_data(self):
         class F(Form):
@@ -714,6 +757,37 @@ class AsyncPlainReturnValueTests(SimpleTestCase):
 
 
 class AsyncCancellationStateTests(SimpleTestCase):
+    async def test_mid_round_reads_keep_last_completed_result(self):
+        gate = asyncio.Event()
+
+        class F(Form):
+            name = CharField()
+
+            async def gated_validator(self, value):
+                await gate.wait()
+
+        form = F({"name": "done"})
+        form.fields["name"].validators.append(async_validator())
+        self.assertIs(await form.ais_valid(), True)
+        self.assertEqual(form.cleaned_data["name"], "done")
+
+        # A new round against changed inputs stays unfinished at the gate.
+        form.data = {"name": "pending"}
+        form.fields["name"].validators.append(form.gated_validator)
+        task = asyncio.create_task(form.ais_valid())
+        await asyncio.sleep(0)
+        # Until the new round completes, external readers (including the
+        # synchronous entry point and BoundField.errors) keep observing the
+        # last completed result rather than an empty or partial one.
+        self.assertEqual(form.cleaned_data["name"], "done")
+        self.assertNotIn("name", form.errors)
+        self.assertEqual(list(form["name"].errors), [])
+        self.assertIs(form.is_valid(), True)
+        gate.set()
+        self.assertIs(await task, True)
+        # The new complete result atomically replaces the old one.
+        self.assertEqual(form.cleaned_data["name"], "pending")
+
     async def test_cancel_restores_last_completed_result(self):
         gate = asyncio.Event()
 
