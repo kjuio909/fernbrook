@@ -812,3 +812,89 @@ class AsyncCancellationStateTests(SimpleTestCase):
         # The next call retries fully against the current inputs.
         self.assertIs(await form.ais_valid(), True)
 
+
+class AsyncSyncInterleaveTests(SimpleTestCase):
+    def _make_form(self, *, fail=False):
+        started = asyncio.Event()
+        gate = asyncio.Event()
+
+        class F(Form):
+            name = CharField()
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                # While True the validator blocks; the later synchronous pass
+                # sets it to False and completes immediately.
+                self.block = True
+
+            def gated_validator(self, value):
+                if self.block:
+
+                    async def wait():
+                        started.set()
+                        await gate.wait()
+                        if fail:
+                            raise ValidationError("async-old-bad")
+
+                    return wait()
+
+        form = F({"name": "old"})
+        form.fields["name"].validators.append(form.gated_validator)
+        return form, started, gate
+
+    async def test_late_async_result_does_not_overwrite_sync_result(self):
+        form, started, gate = self._make_form()
+        task = asyncio.create_task(form.ais_valid())
+        await started.wait()
+        # The inputs change and a synchronous validation completes while the
+        # async round is blocked inside its validator.
+        form.data = {"name": "new"}
+        form.block = False
+        form.full_clean()
+        self.assertEqual(form.cleaned_data, {"name": "new"})
+
+        gate.set()
+        self.assertIs(await task, True)
+        # The late async completion served its own snapshot to its waiter but
+        # must never publish over the newer synchronous result.
+        self.assertEqual(form.cleaned_data, {"name": "new"})
+        self.assertEqual(dict(form.errors), {})
+        # The synchronous result is reusable without another round.
+        self.assertIs(await form.ais_valid(), True)
+        self.assertEqual(form.cleaned_data, {"name": "new"})
+
+    async def test_late_async_failure_does_not_delete_sync_errors(self):
+        form, started, gate = self._make_form(fail=True)
+        task = asyncio.create_task(form.ais_valid())
+        await started.wait()
+        # New inputs fail synchronously with a different error.
+        form.data = {"name": ""}
+        form.block = False
+        form.full_clean()
+        sync_errors = form.errors.as_json()
+        self.assertIn("required", sync_errors)
+
+        gate.set()
+        self.assertIs(await task, False)
+        # The stale async failure must not replace the synchronous errors.
+        self.assertEqual(form.errors.as_json(), sync_errors)
+        self.assertIn("required", form.errors.as_json())
+
+    async def test_cancelling_stale_waiter_keeps_sync_result(self):
+        form, started, gate = self._make_form()
+        task = asyncio.create_task(form.ais_valid())
+        await started.wait()
+        # A synchronous pass over the same inputs becomes the newest result.
+        form.block = False
+        form.full_clean()
+        self.assertEqual(form.cleaned_data, {"name": "old"})
+        # Abandoning the stale waiter must not discard the synchronous result
+        # or its cached fingerprint.
+        task.cancel()
+        gate.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.05)
+        self.assertIs(await form.ais_valid(), True)
+        self.assertEqual(form.cleaned_data, {"name": "old"})
+

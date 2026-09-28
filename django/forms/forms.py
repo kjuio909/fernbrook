@@ -87,7 +87,7 @@ class _AsyncValidationState:
     round.
     """
 
-    def __init__(self, *, is_bound, inputs, fields, fingerprint):
+    def __init__(self, *, epoch, is_bound, inputs, fields, fingerprint):
         self.runner_task = None
         # Number of ais_valid() callers currently awaiting the runner task.
         self.waiters = 0
@@ -98,6 +98,11 @@ class _AsyncValidationState:
         # newer round superseded it. The runner keeps driving its own
         # snapshot for its remaining waiters but can never publish.
         self.detached = False
+        # Validation epoch the round was started in. A synchronous
+        # full_clean() while the round is in flight advances the epoch, so a
+        # late async completion can never publish over the newer synchronous
+        # result.
+        self.epoch = epoch
         # Whether the form was bound when the round started.
         self.is_bound = is_bound
         # Detached snapshots the round cleans against. Inputs rebound or
@@ -187,6 +192,11 @@ class BaseForm(RenderableFormMixin):
         # Fingerprint of the inputs/field definitions used by the last
         # successfully completed validation round, for reuse checks.
         self._validation_fingerprint = None
+        # Bumped by every synchronous full_clean(). An async round whose
+        # epoch no longer matches keeps serving its own waiters but can never
+        # publish, so an async completion can never overwrite a newer
+        # synchronous result.
+        self._validation_epoch = 0
 
         # The base_fields class attribute is the *class-wide* definition of
         # fields. Because a particular *instance* of the class might want to
@@ -583,6 +593,7 @@ class BaseForm(RenderableFormMixin):
             inputs=inputs,
             fields=fields,
             fingerprint=self._build_snapshot_fingerprint(inputs, fields),
+            epoch=self._validation_epoch,
         )
         # The round keeps private staging collections (installed as its first
         # step). The form's last successfully completed self._errors /
@@ -636,7 +647,11 @@ class BaseForm(RenderableFormMixin):
     def _finish_async_validation(self, state):
         state.finalized = True
         state.result = state.is_bound and not state.errors
-        if not state.detached and self._async_validation is state:
+        if (
+            not state.detached
+            and self._async_validation is state
+            and self._validation_epoch == state.epoch
+        ):
             # Atomically publish this round's staging as the form result.
             self._errors = state.errors
             self._cleaned_data = state.cleaned_data
@@ -644,6 +659,9 @@ class BaseForm(RenderableFormMixin):
             self._async_validation = None
         # A detached (superseded) round keeps its conclusion only to serve
         # its own waiters via state.result; it never writes the form state.
+        # Likewise a round whose epoch was superseded by a synchronous
+        # full_clean() keeps its conclusion for its waiters but cannot
+        # overwrite the newer synchronous result.
         self._retire_async_validation(state)
 
     def _discard_async_validation(self, state):
@@ -779,6 +797,15 @@ class BaseForm(RenderableFormMixin):
         """
         Clean all of self.data and populate self._errors and self.cleaned_data.
         """
+        # A synchronous validation is the newest validation generation.
+        # Detach in-flight async rounds so a late async completion -- success,
+        # failure or cancellation -- can never overwrite or delete the
+        # synchronous result about to be produced. The rounds keep running
+        # for their own waiters, which still receive the round's conclusion.
+        self._validation_epoch += 1
+        for state in self._async_rounds:
+            state.detached = True
+        self._async_validation = None
         self._errors = ErrorDict(renderer=self.renderer)
         if not self.is_bound:  # Stop further processing.
             self._record_validation_fingerprint()
