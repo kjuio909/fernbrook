@@ -103,6 +103,26 @@ class GeometryField(forms.Field):
 
         return geom
 
+    async def aclean(self, value):
+        geom = await super().aclean(value)
+        if geom is None:
+            return geom
+        if (
+            str(geom.geom_type).upper() != self.geom_type
+            and self.geom_type != "GEOMETRY"
+        ):
+            raise ValidationError(
+                self.error_messages["invalid_geom_type"], code="invalid_geom_type"
+            )
+        if self.srid and self.srid != -1 and self.srid != geom.srid:
+            try:
+                geom.transform(self.srid)
+            except GEOSException:
+                raise ValidationError(
+                    self.error_messages["transform_error"], code="transform_error"
+                )
+        return geom
+
     def has_changed(self, initial, data):
         """Compare geographic value of data with its initial value."""
 

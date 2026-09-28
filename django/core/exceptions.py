@@ -263,3 +263,9 @@ class SynchronousOnlyOperation(Exception):
     """The user tried to call a sync-only function from an async context."""
 
     pass
+
+
+class AsynchronousOnlyOperation(Exception):
+    """The user tried to call an async-only function from a sync context."""
+
+    pass

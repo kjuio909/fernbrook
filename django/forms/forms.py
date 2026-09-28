@@ -2,11 +2,15 @@
 Form classes
 """
 
+import asyncio
 import copy
 import datetime
+from contextvars import ContextVar
+from functools import partial
+from inspect import isawaitable
 
 from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
-from django.forms.fields import Field
+from django.forms.fields import Field, _reject_awaitable_in_sync
 from django.forms.utils import ErrorDict, ErrorList, RenderableFormMixin
 from django.forms.widgets import Media, MediaDefiningClass
 from django.utils.datastructures import MultiValueDict
@@ -16,6 +20,69 @@ from django.utils.translation import gettext as _
 from .renderers import get_default_renderer
 
 __all__ = ("BaseForm", "Form")
+
+
+# The _AsyncValidation of the asynchronous cleaning round currently running
+# in this task. It only identifies the cleaning task (so the public
+# errors/cleaned_data attributes gate *other* tasks away from the live,
+# not-yet-committed round state). The round state itself lives on the form
+# instance (self._errors/self.cleaned_data), exactly as in the synchronous
+# flow, so existing cleaning code -- including direct self._errors access in
+# ModelForm._post_clean() -- works unchanged.
+_async_clean_state = ContextVar("baseform_async_clean_state", default=None)
+
+
+class _AsyncValidation:
+    """
+    Bookkeeping for a single shared asynchronous round of full_clean().
+
+    Concurrent callers share one instance so validators with side effects
+    run only once. While the round runs it writes the live state onto the
+    form; tasks other than the cleaning task are gated to empty views. When
+    the round is abandoned (every caller cancels) or raises an ordinary
+    exception, the previous committed state is restored, so the unfinished
+    result is never exposed or cached.
+    """
+
+    __slots__ = (
+        "form",
+        "signature",
+        "task",
+        "settled",
+        "waiters",
+        "finished",
+        "abandoned",
+        "previous",
+    )
+
+    def __init__(self, form, signature):
+        self.form = form
+        # Input snapshots this round started with. They are swapped onto the
+        # form while the round runs, so a task joining later (or a mutation
+        # of form.data) cannot rewrite the inputs or the result.
+        self.signature = signature
+        self.task = None
+        # Set once the cleaning task has fully finished tearing itself down
+        # (including restoring the form inputs/state), so callers can wait
+        # for an abandoned round to settle before retrying.
+        self.settled = asyncio.Event()
+        self.waiters = 0
+        self.finished = False
+        self.abandoned = False
+        # The committed (errors, cleaned_data, signature) to restore if the
+        # round is abandoned or fails.
+        self.previous = None
+
+
+def _validation_task_done(state, task):
+    # Backstop for a task cancelled before it could run its own teardown:
+    # detach it from the form and release anyone waiting to retry.
+    if not task.cancelled():
+        task.exception()
+    form = state.form
+    if form._async_validation is state:
+        form._async_validation = None
+    state.settled.set()
 
 
 class DeclarativeFieldsMetaclass(MediaDefiningClass):
@@ -97,6 +164,14 @@ class BaseForm(RenderableFormMixin):
         self.label_suffix = label_suffix if label_suffix is not None else _(":")
         self.empty_permitted = empty_permitted
         self._errors = None  # Stores the errors after clean() has been called.
+        self._cleaned_data = None  # Stores the cleaned data after clean().
+        # Signature of the inputs (data/files/initial) represented by
+        # ``_errors``/``_cleaned_data`` so repeated validation calls with
+        # unchanged inputs can reuse the completed result.
+        self._validation_signature = None
+        # The shared _AsyncValidation of the asynchronous round currently in
+        # progress, or None when no round is running.
+        self._async_validation = None
 
         # The base_fields class attribute is the *class-wide* definition of
         # fields. Because a particular *instance* of the class might want to
@@ -194,16 +269,67 @@ class BaseForm(RenderableFormMixin):
             self._bound_fields_cache[name] = field.get_bound_field(self, name)
         return self._bound_fields_cache[name]
 
+    def _async_state(self):
+        """
+        Return the _AsyncValidation owned by the cleaning task running in
+        this task for this form, or None.
+        """
+        state = _async_clean_state.get()
+        if state is not None and state.form is self:
+            return state
+        return None
+
     @property
     def errors(self):
         """Return an ErrorDict for the data provided for the form."""
+        if self._async_state() is None and self._async_validation is not None:
+            # A round is running in another task: never expose its partial
+            # errors nor the previous round's residue.
+            return ErrorDict(renderer=self.renderer)
         if self._errors is None:
             self.full_clean()
         return self._errors
 
+    @property
+    def cleaned_data(self):
+        if self._async_state() is None and self._async_validation is not None:
+            # Cleaning is ongoing in another task: do not expose partial data
+            # or the previously committed round.
+            return {}
+        if self._cleaned_data is None:
+            raise AttributeError("cleaned_data")
+        return self._cleaned_data
+
+    @cleaned_data.setter
+    def cleaned_data(self, value):
+        self._cleaned_data = value
+
     def is_valid(self):
         """Return True if the form has no errors, or False otherwise."""
         return self.is_bound and not self.errors
+
+    async def ais_valid(self):
+        """
+        Asynchronous counterpart of is_valid(): run the asynchronous
+        validation (awaiting any awaitable results returned by field
+        cleaning, field validators, clean_<field>() and clean()) and return
+        True if the form has no errors, or False otherwise.
+        """
+        await self.afull_clean()
+        return self.is_bound and not self._errors
+
+    def _validation_inputs_signature(self):
+        """
+        Snapshot of the inputs validation depends on, used to reuse a
+        completed round when the data/files/initial did not change.
+        """
+        return (
+            self.is_bound,
+            self.data.copy(),
+            self.files.copy(),
+            copy.copy(self.initial),
+            self.empty_permitted,
+        )
 
     def add_prefix(self, field_name):
         """
@@ -295,23 +421,27 @@ class BaseForm(RenderableFormMixin):
         else:
             error = {field or NON_FIELD_ERRORS: error.error_list}
 
+        errors = self.errors
         for field, error_list in error.items():
-            if field not in self.errors:
+            if field not in errors:
                 if field != NON_FIELD_ERRORS and field not in self.fields:
                     raise ValueError(
                         "'%s' has no field named '%s'."
                         % (self.__class__.__name__, field)
                     )
                 if field == NON_FIELD_ERRORS:
-                    self._errors[field] = self.error_class(
+                    errors[field] = self.error_class(
                         error_class="nonfield", renderer=self.renderer
                     )
                 else:
-                    self._errors[field] = self.error_class(
+                    errors[field] = self.error_class(
                         renderer=self.renderer,
                         field_id=self[field].auto_id,
                     )
-            self._errors[field].extend(error_list)
+            errors[field].extend(error_list)
+            # Access cleaned_data only through the (possibly asynchronous)
+            # attribute; keep it out of a local variable so sensitive values
+            # are never captured in a traceback frame.
             if field in self.cleaned_data:
                 del self.cleaned_data[field]
 
@@ -326,6 +456,7 @@ class BaseForm(RenderableFormMixin):
         Clean all of self.data and populate self._errors and self.cleaned_data.
         """
         self._errors = ErrorDict(renderer=self.renderer)
+        self._validation_signature = self._validation_inputs_signature()
         if not self.is_bound:  # Stop further processing.
             return
         self.cleaned_data = {}
@@ -334,9 +465,201 @@ class BaseForm(RenderableFormMixin):
         if self.empty_permitted and not self.has_changed():
             return
 
-        self._clean_fields()
-        self._clean_form()
-        self._post_clean()
+        try:
+            self._clean_fields()
+            self._clean_form()
+            self._post_clean()
+        except Exception:
+            # An ordinary exception propagates as-is (it is not turned into a
+            # form error), and the partial round must not become a reusable
+            # cached result for a subsequent validation call. Drop only the
+            # signature so nothing is reused; the partial ``_errors`` stays
+            # accessible, preserving the synchronous behaviour.
+            self._validation_signature = None
+            raise
+
+    async def afull_clean(self):
+        """
+        Asynchronous counterpart of full_clean(): put self.data through the
+        asynchronous cleaning steps (awaiting awaitable results returned by
+        field cleaning, field validators, clean_<field>() and clean()) and
+        populate self._errors and self.cleaned_data with the result.
+
+        Concurrent calls for the same inputs share a single round, so
+        validators with side effects run at most once per round.
+        """
+        signature = self._validation_inputs_signature()
+        # Reuse a completed (synchronous or asynchronous) round when the
+        # inputs did not change.
+        if (
+            self._async_validation is None
+            and self._errors is not None
+            and self._validation_signature == signature
+        ):
+            return
+        state = self._async_validation
+        if state is not None:
+            if state.abandoned or state.signature != signature:
+                # The round in progress was given up by all of its waiters,
+                # or it cleans different inputs. It cannot be rewritten; wait
+                # for it to settle and then run a fresh round for the
+                # current inputs.
+                await state.settled.wait()
+                await self.afull_clean()
+                return
+        else:
+            state = _AsyncValidation(self, signature)
+            self._async_validation = state
+            state.task = asyncio.ensure_future(self._arun_validation(state))
+            state.task.add_done_callback(partial(_validation_task_done, state))
+        await self._await_validation(state)
+
+    async def _await_validation(self, state):
+        state.waiters += 1
+        try:
+            # shield(): a cancelled waiter abandons only its own wait; the
+            # shared cleaning task keeps running while another waiter is
+            # still waiting.
+            await asyncio.shield(state.task)
+        finally:
+            state.waiters -= 1
+            if (
+                state.waiters == 0
+                and not state.finished
+                and not state.task.done()
+            ):
+                # Every waiter has left while the round was still running:
+                # abandon it. The unfinished result and temporary errors are
+                # discarded, so the next call can clean from scratch.
+                state.abandoned = True
+                state.task.cancel()
+
+    async def _arun_validation(self, state):
+        """The single shared cleaning task for one afull_clean() round."""
+        token = _async_clean_state.set(state)
+        # The round writes its live state onto the instance, just like the
+        # synchronous flow. Direct self._errors/self.cleaned_data access in
+        # cleaning hooks (e.g. ModelForm._post_clean()) therefore works.
+        state.previous = (
+            self._errors,
+            self._cleaned_data,
+            self._validation_signature,
+        )
+        saved_inputs = self._swap_validation_inputs(state.signature)
+        # Bound fields cache their initial value; rebuild them so the round
+        # reads the inputs it started with (and a retry reads new inputs).
+        saved_bound_fields = self._bound_fields_cache
+        self._bound_fields_cache = {}
+        # changed_data is derived from the inputs and cached; drop it for the
+        # round so it is recomputed against the round's own inputs.
+        self.__dict__.pop("changed_data", None)
+        try:
+            await self._afull_clean()
+        except BaseException:
+            # Discard the unfinished result on cancellation and on ordinary
+            # exceptions alike: restore the previous committed state so no
+            # partial errors/data are exposed or reused. Ordinary exceptions
+            # propagate to every waiter without becoming form errors.
+            self._restore_committed_state(state)
+            raise
+        else:
+            if state.abandoned:
+                # The round was given up while it was still running (it only
+                # got here because cleaning swallowed the cancellation). Its
+                # result must not be committed.
+                self._restore_committed_state(state)
+                return
+            state.finished = True
+            self._validation_signature = state.signature
+        finally:
+            self._restore_validation_inputs(saved_inputs)
+            self._bound_fields_cache = saved_bound_fields
+            # Drop the round-computed cache; it is lazily recomputed against
+            # the restored (current) inputs on the next access.
+            self.__dict__.pop("changed_data", None)
+            _async_clean_state.reset(token)
+            if self._async_validation is state:
+                self._async_validation = None
+            state.settled.set()
+
+    def _restore_committed_state(self, state):
+        errors, cleaned_data, signature = state.previous
+        self._errors = errors
+        self._cleaned_data = cleaned_data
+        self._validation_signature = signature
+
+    def _swap_validation_inputs(self, signature):
+        is_bound, data, files, initial, empty_permitted = signature
+        saved = (
+            self.is_bound,
+            self.data,
+            self.files,
+            self.initial,
+            self.empty_permitted,
+        )
+        self.is_bound = is_bound
+        self.data = data
+        self.files = files
+        self.initial = initial
+        self.empty_permitted = empty_permitted
+        return saved
+
+    def _restore_validation_inputs(self, saved):
+        (
+            self.is_bound,
+            self.data,
+            self.files,
+            self.initial,
+            self.empty_permitted,
+        ) = saved
+
+    async def _afull_clean(self):
+        self._errors = ErrorDict(renderer=self.renderer)
+        if not self.is_bound:  # Stop further processing.
+            return
+        self.cleaned_data = {}
+        # If the form is permitted to be empty, and none of the form data has
+        # changed from the initial data, short circuit any validation.
+        if self.empty_permitted and not self.has_changed():
+            return
+
+        await self._aclean_fields()
+        await self._aclean_form()
+        await self._apost_clean()
+
+    async def _aclean_fields(self):
+        for name, bf in self._bound_items():
+            field = bf.field
+            try:
+                self.cleaned_data[name] = await field._aclean_bound_field(bf)
+                if hasattr(self, "clean_%s" % name):
+                    value = getattr(self, "clean_%s" % name)()
+                    if isawaitable(value):
+                        value = await value
+                    self.cleaned_data[name] = value
+            except ValidationError as e:
+                self.add_error(name, e)
+
+    async def _aclean_form(self):
+        try:
+            cleaned_data = self.clean()
+            if isawaitable(cleaned_data):
+                cleaned_data = await cleaned_data
+        except ValidationError as e:
+            self.add_error(None, e)
+        else:
+            if cleaned_data is not None:
+                self.cleaned_data = cleaned_data
+
+    async def _apost_clean(self):
+        """
+        Asynchronous counterpart of _post_clean(). By default the
+        synchronous hook runs; an awaitable result it returns is awaited.
+        Used for model validation in model forms.
+        """
+        result = self._post_clean()
+        if isawaitable(result):
+            await result
 
     def _clean_fields(self):
         for name, bf in self._bound_items():
@@ -345,6 +668,10 @@ class BaseForm(RenderableFormMixin):
                 self.cleaned_data[name] = field._clean_bound_field(bf)
                 if hasattr(self, "clean_%s" % name):
                     value = getattr(self, "clean_%s" % name)()
+                    if isawaitable(value):
+                        _reject_awaitable_in_sync(
+                            value, "%s.clean_%s()" % (type(self).__name__, name)
+                        )
                     self.cleaned_data[name] = value
             except ValidationError as e:
                 self.add_error(name, e)
@@ -355,6 +682,10 @@ class BaseForm(RenderableFormMixin):
         except ValidationError as e:
             self.add_error(None, e)
         else:
+            if isawaitable(cleaned_data):
+                _reject_awaitable_in_sync(
+                    cleaned_data, "%s.clean()" % type(self).__name__
+                )
             if cleaned_data is not None:
                 self.cleaned_data = cleaned_data
 

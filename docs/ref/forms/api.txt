@@ -121,6 +121,40 @@ valid email address:
     >>> f.is_valid()
     False
 
+.. method:: Form.ais_valid()
+
+Asynchronous version of :meth:`~Form.is_valid`. It must be awaited and runs
+the same validation, awaiting any awaitable result returned by field
+cleaning, field validators, :ref:`clean_<fieldname>()
+<validating-fields-with-clean>` and :meth:`~Form.clean` instead of treating
+it as the cleaned value:
+
+.. code-block:: python
+
+    from django import forms
+
+
+    class ContactForm(forms.Form):
+        subject = forms.CharField()
+
+        async def clean_subject(self):
+            # await an asynchronous check here ...
+            return self.cleaned_data["subject"]
+
+
+    async def view(request):
+        form = ContactForm(request.POST)
+        if await form.ais_valid():
+            # The form is valid and form.errors and form.cleaned_data are
+            # populated exactly as they are after a successful is_valid().
+            ...
+
+Concurrent calls on the same form instance with unchanged inputs share a
+single validation run. Calling the synchronous :meth:`~Form.is_valid` on a
+form whose validators or cleaning hooks return awaitables raises
+:class:`~django.core.exceptions.AsynchronousOnlyOperation`; use
+``ais_valid()`` there.
+
 .. attribute:: Form.errors
 
 Access the :attr:`~Form.errors` attribute to get a dictionary of error

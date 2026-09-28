@@ -33,6 +33,13 @@ class SimpleArrayField(forms.CharField):
         value = super().clean(value)
         return [self.base_field.clean(val) for val in value]
 
+    async def aclean(self, value):
+        value = await super().aclean(value)
+        result = []
+        for val in value:
+            result.append(await self.base_field.aclean(val))
+        return result
+
     def prepare_value(self, value):
         if isinstance(value, list):
             return self.delimiter.join(
@@ -89,6 +96,24 @@ class SimpleArrayField(forms.CharField):
         for index, item in enumerate(value):
             try:
                 self.base_field.run_validators(item)
+            except ValidationError as error:
+                errors.append(
+                    prefix_validation_error(
+                        error,
+                        prefix=self.error_messages["item_invalid"],
+                        code="item_invalid",
+                        params={"nth": index + 1},
+                    )
+                )
+        if errors:
+            raise ValidationError(errors)
+
+    async def arun_validators(self, value):
+        await super().arun_validators(value)
+        errors = []
+        for index, item in enumerate(value):
+            try:
+                await self.base_field.arun_validators(item)
             except ValidationError as error:
                 errors.append(
                     prefix_validation_error(
@@ -218,6 +243,36 @@ class SplitArrayField(forms.Field):
             item = value[index]
             try:
                 cleaned_data.append(self.base_field.clean(item))
+            except ValidationError as error:
+                errors.append(
+                    prefix_validation_error(
+                        error,
+                        self.error_messages["item_invalid"],
+                        code="item_invalid",
+                        params={"nth": index + 1},
+                    )
+                )
+                cleaned_data.append(item)
+            else:
+                errors.append(None)
+        cleaned_data, null_index = self._remove_trailing_nulls(cleaned_data)
+        if null_index is not None:
+            errors = errors[:null_index]
+        errors = list(filter(None, errors))
+        if errors:
+            raise ValidationError(list(chain.from_iterable(errors)))
+        return cleaned_data
+
+    async def aclean(self, value):
+        cleaned_data = []
+        errors = []
+        if not any(value) and self.required:
+            raise ValidationError(self.error_messages["required"])
+        max_size = max(self.size, len(value))
+        for index in range(max_size):
+            item = value[index]
+            try:
+                cleaned_data.append(await self.base_field.aclean(item))
             except ValidationError as error:
                 errors.append(
                     prefix_validation_error(
