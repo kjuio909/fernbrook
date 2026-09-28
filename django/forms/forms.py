@@ -119,11 +119,16 @@ class _AsyncValidationState:
         # in-flight round.
         self.fingerprint = fingerprint
         # Private staging of the round. The form's last successfully
-        # published self._errors / self._cleaned_data stay untouched until
-        # this round completes and atomically swaps them in, so external
-        # readers never observe a half-finished result.
+        # published self._errors / self._cleaned_data / changed_data stay
+        # untouched until this round completes and atomically swaps them in,
+        # so external readers never observe a half-finished result.
         self.errors = None
         self.cleaned_data = _UNSET
+        # Names of the fields whose snapshot values differ from the round's
+        # initial data; computed once from the round snapshot. The empty
+        # permitted short-circuit consults it and the result is published
+        # together with errors and cleaned_data.
+        self.changed_data = None
         # The business result of a completed round, shared with every waiter
         # so callers observe one identical conclusion even if the form is
         # re-validated or reset between the runner finishing and the waiters
@@ -655,6 +660,7 @@ class BaseForm(RenderableFormMixin):
             # Atomically publish this round's staging as the form result.
             self._errors = state.errors
             self._cleaned_data = state.cleaned_data
+            self.changed_data = state.changed_data
             self._validation_fingerprint = state.fingerprint
             self._async_validation = None
         # A detached (superseded) round keeps its conclusion only to serve
@@ -806,6 +812,10 @@ class BaseForm(RenderableFormMixin):
         for state in self._async_rounds:
             state.detached = True
         self._async_validation = None
+        # The bound inputs are about to define a new result, so a changed_data
+        # list cached for earlier inputs must not survive the pass; the checks
+        # below repopulate it from the current data and initial.
+        del self.changed_data
         self._errors = ErrorDict(renderer=self.renderer)
         if not self.is_bound:  # Stop further processing.
             self._record_validation_fingerprint()
@@ -915,6 +925,9 @@ class BaseForm(RenderableFormMixin):
         # Fresh private staging for this round; the previously published
         # collections stay untouched until the round finishes.
         state.errors = ErrorDict(renderer=self.renderer)
+        # Determine the changed fields from the round snapshot before any
+        # early return so every published result carries a concrete list.
+        state.changed_data = self.changed_data
         if not state.is_bound:  # Stop further processing.
             return
         self.cleaned_data = {}
@@ -956,10 +969,18 @@ class BaseForm(RenderableFormMixin):
 
     @property
     def changed_data(self):
-        if self._current_async_state() is not None:
-            # Compute from the round snapshot without populating the shared
-            # cache, which must stay tied to the live inputs.
-            return [name for name, bf in self._bound_items() if bf._has_changed()]
+        state = self._current_async_state()
+        if state is not None:
+            # Determine the changed fields once from the round snapshot and
+            # keep the result with the round so the empty permitted short
+            # circuit decision and the published changed_data agree. The
+            # shared cache is never populated, so it stays tied to the live
+            # inputs.
+            if state.changed_data is None:
+                state.changed_data = [
+                    name for name, bf in self._bound_items() if bf._has_changed()
+                ]
+            return state.changed_data
         try:
             return self.__dict__["changed_data"]
         except KeyError:
