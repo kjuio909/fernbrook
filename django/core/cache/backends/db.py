@@ -209,15 +209,19 @@ class DatabaseCache(BaseDatabaseCache):
                 return True
 
     def delete(self, key, version=None):
-        self._retire_aget_or_set_in_flight(key, version)
-        key = self.make_and_validate_key(key, version=version)
-        return self._base_delete_many([key])
+        with self._retiring_aget_or_set(key, version) as made_key:
+            return self._base_delete_many([made_key])
 
     def delete_many(self, keys, version=None):
-        for key in keys:
-            self._retire_aget_or_set_in_flight(key, version)
-        keys = [self.make_and_validate_key(key, version=version) for key in keys]
-        self._base_delete_many(keys)
+        made_keys = [self.make_and_validate_key(key, version=version) for key in keys]
+        # Detach every affected round and delete the rows in one critical
+        # section so a detached generation's commit can't race the removal.
+        with self._aget_or_set_lock:
+            for made_key in made_keys:
+                self._discard_finished_generation(
+                    self._aget_or_set_in_flight.pop(made_key, None)
+                )
+            self._base_delete_many(made_keys)
 
     def _base_delete_many(self, keys):
         if not keys:
@@ -295,9 +299,9 @@ class DatabaseCache(BaseDatabaseCache):
                     )
 
     def clear(self):
-        self._retire_all_aget_or_set_in_flight()
-        db = router.db_for_write(self.cache_model_class)
-        connection = connections[db]
-        table = connection.ops.quote_name(self._table)
-        with connection.cursor() as cursor:
-            cursor.execute("DELETE FROM %s" % table)
+        with self._retiring_all_aget_or_set():
+            db = router.db_for_write(self.cache_model_class)
+            connection = connections[db]
+            table = connection.ops.quote_name(self._table)
+            with connection.cursor() as cursor:
+                cursor.execute("DELETE FROM %s" % table)

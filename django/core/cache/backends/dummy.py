@@ -23,8 +23,8 @@ class DummyCache(BaseCache):
         return False
 
     def delete(self, key, version=None):
-        self._retire_aget_or_set_in_flight(key, version)
-        self.make_and_validate_key(key, version=version)
+        with self._retiring_aget_or_set(key, version):
+            pass
         return False
 
     def has_key(self, key, version=None):
@@ -32,4 +32,5 @@ class DummyCache(BaseCache):
         return False
 
     def clear(self):
-        self._retire_all_aget_or_set_in_flight()
+        with self._retiring_all_aget_or_set():
+            pass

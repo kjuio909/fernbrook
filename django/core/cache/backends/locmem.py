@@ -26,11 +26,14 @@ class LocMemCache(BaseCache):
     def add(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
         key = self.make_and_validate_key(key, version=version)
         pickled = pickle.dumps(value, self.pickle_protocol)
-        with self._lock:
-            if self._has_expired(key):
-                self._set(key, pickled, timeout)
-                return True
-            return False
+        # Hold the coordination lock across the insertion (and a possible
+        # cull) so a generation's commit fence and an eviction can't race.
+        with self._aget_or_set_lock:
+            with self._lock:
+                if self._has_expired(key):
+                    self._set(key, pickled, timeout)
+                    return True
+                return False
 
     def get(self, key, default=None, version=None):
         key = self.make_and_validate_key(key, version=version)
@@ -52,11 +55,16 @@ class LocMemCache(BaseCache):
     def set(self, key, value, timeout=DEFAULT_TIMEOUT, version=None):
         key = self.make_and_validate_key(key, version=version)
         pickled = pickle.dumps(value, self.pickle_protocol)
-        with self._lock:
-            self._set(key, pickled, timeout)
-        # An unconditional write outlives any generation in flight: if it is
-        # later deleted or expires, a later miss must not rejoin that round.
-        self._note_aget_or_set_repopulation(key)
+        # Hold the coordination lock across the write (and a possible cull):
+        # a cull can evict an entry whose generation is in flight, and the
+        # round must be detached while commits are fenced off.
+        with self._aget_or_set_lock:
+            with self._lock:
+                self._set(key, pickled, timeout)
+            # An unconditional write outlives any generation in flight: if it
+            # is later deleted or expires, a later miss must not rejoin that
+            # round.
+            self._note_aget_or_set_repopulation(key)
 
     def touch(self, key, timeout=DEFAULT_TIMEOUT, version=None):
         key = self.make_and_validate_key(key, version=version)
@@ -93,10 +101,17 @@ class LocMemCache(BaseCache):
         return exp is not None and exp <= time.time()
 
     def _cull(self):
+        # Called from set()/add(), which already hold the coordination lock.
         if self._cull_frequency == 0:
+            # A full cull is equivalent to clear(): every entry (and thus
+            # every registered round) is invalidated. Partial culls can only
+            # evict entries already committed; an in-flight entry is present
+            # solely via an unconditional external write, which set its
+            # round's repopulated flag and keeps the generation's commit
+            # fenced off without detaching the round.
             self._cache.clear()
             self._expire_info.clear()
-            self._retire_all_aget_or_set_in_flight()
+            self._retire_aget_or_set_all_locked()
         else:
             count = len(self._cache) // self._cull_frequency
             for i in range(count):
@@ -112,13 +127,12 @@ class LocMemCache(BaseCache):
         return True
 
     def delete(self, key, version=None):
-        self._retire_aget_or_set_in_flight(key, version)
-        key = self.make_and_validate_key(key, version=version)
-        with self._lock:
-            return self._delete(key)
+        with self._retiring_aget_or_set(key, version) as made_key:
+            with self._lock:
+                return self._delete(made_key)
 
     def clear(self):
-        with self._lock:
-            self._cache.clear()
-            self._expire_info.clear()
-            self._retire_all_aget_or_set_in_flight()
+        with self._retiring_all_aget_or_set():
+            with self._lock:
+                self._cache.clear()
+                self._expire_info.clear()

@@ -94,8 +94,8 @@ class FileBasedCache(BaseCache):
             return False
 
     def delete(self, key, version=None):
-        self._retire_aget_or_set_in_flight(key, version)
-        return self._delete(self._key_to_file(key, version))
+        with self._retiring_aget_or_set(key, version) as made_key:
+            return self._delete(self._made_key_to_file(made_key))
 
     def _delete(self, fname):
         if not fname.startswith(self._dir) or not os.path.exists(fname):
@@ -160,9 +160,9 @@ class FileBasedCache(BaseCache):
         """
         Remove all the cache files.
         """
-        self._retire_all_aget_or_set_in_flight()
-        for fname in self._list_cache_files():
-            self._delete(fname)
+        with self._retiring_all_aget_or_set():
+            for fname in self._list_cache_files():
+                self._delete(fname)
 
     def _is_expired(self, f):
         """

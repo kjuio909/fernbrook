@@ -1957,6 +1957,99 @@ class BaseCacheTests:
         self.assertEqual(await retired, "new")
         self.assertEqual(await cache.aget("key"), "new")
 
+    async def test_aget_or_set_delete_no_new_round_not_resurrected(self):
+        """A retired round's late commit never recreates the deleted entry."""
+        gate = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def slow_default():
+            entered.set()
+            await gate.wait()
+            return "old"
+
+        retired = asyncio.create_task(cache.aget_or_set("key", slow_default))
+        await entered.wait()
+        # Delete while the round is paused; no new request repopulates the
+        # entry before the old generation commits.
+        await cache.adelete("key")
+        gate.set()
+        # The old round's participants still receive their own result ...
+        self.assertEqual(await retired, "old")
+        # ... but it is not stored: no half-finished readable entry is left
+        # behind and the next miss regenerates from scratch.
+        self.assertIsNone(await cache.aget("key"))
+        self.assertEqual(await cache.aget_or_set("key", "new"), "new")
+        self.assertEqual(await cache.aget("key"), "new")
+
+    async def test_aget_or_set_expired_no_new_round_not_resurrected(self):
+        """A stale round can't repopulate an entry that naturally expired."""
+        gate = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def slow_default():
+            entered.set()
+            await gate.wait()
+            return "old"
+
+        retired = asyncio.create_task(cache.aget_or_set("key", slow_default))
+        await entered.wait()
+        await cache.aset("key", "external", timeout=self.short_timeout)
+        await self._wait_for_aget_or_set_expiry(cache, "key")
+        gate.set()
+        self.assertEqual(await retired, "old")
+        # The expired entry is not resurrected with the stale value.
+        self.assertIsNone(await cache.aget("key"))
+        self.assertEqual(await cache.aget_or_set("key", "new"), "new")
+        self.assertEqual(await cache.aget("key"), "new")
+
+    async def test_aget_or_set_retired_round_cant_override_new_round(self):
+        """A retiring round committing last can't overwrite the new round."""
+        old_gate, entered = asyncio.Event(), asyncio.Event()
+
+        async def old_default():
+            entered.set()
+            await old_gate.wait()
+            return "old"
+
+        retired = asyncio.create_task(cache.aget_or_set("key", old_default))
+        await entered.wait()
+        await cache.adelete("key")
+        new_gate = asyncio.Event()
+
+        async def new_default():
+            await new_gate.wait()
+            return "new"
+
+        leader = asyncio.create_task(cache.aget_or_set("key", new_default))
+        await self._wait_for_aget_or_set_participants(cache, "key", 1)
+        # Let the new round commit first while the old round is still paused.
+        new_gate.set()
+        self.assertEqual(await leader, "new")
+        # The old round then completes; its stale value must not replace the
+        # committed new value.
+        old_gate.set()
+        self.assertEqual(await retired, "new")
+        self.assertEqual(await cache.aget("key"), "new")
+
+    async def test_aget_or_set_clear_no_new_round_not_repopulated(self):
+        """A round retired by clear() can't repopulate the cleared entry."""
+        gate = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def slow_default():
+            entered.set()
+            await gate.wait()
+            return "old"
+
+        retired = asyncio.create_task(cache.aget_or_set("key", slow_default))
+        await entered.wait()
+        await cache.aset("key", "external")
+        await cache.aclear()
+        gate.set()
+        self.assertEqual(await retired, "old")
+        self.assertIsNone(await cache.aget("key"))
+        self.assertEqual(await cache.aget_or_set("key", "new"), "new")
+
     async def test_aget_or_set_zero_timeout(self):
         """An explicit zero timeout returns the value without storing it."""
         self.assertEqual(await cache.aget_or_set("key", "eggs", 0), "eggs")
@@ -2157,10 +2250,14 @@ class BaseCacheTests:
 
         # A round whose generation already failed, still registered because
         # its participants haven't finished unwinding.
-        in_flight = _AsyncInFlightGeneration(
-            cache._aget_or_set_generate("key", failing_default, DEFAULT_TIMEOUT, None)
+        made_key = cache.make_key("key")
+        in_flight = _AsyncInFlightGeneration()
+        cache._aget_or_set_in_flight[made_key] = in_flight
+        in_flight.start(
+            cache._aget_or_set_generate(
+                "key", failing_default, DEFAULT_TIMEOUT, None, made_key, in_flight
+            )
         )
-        cache._aget_or_set_in_flight[cache.make_key("key")] = in_flight
         await self._wait_for_generation_task(in_flight.task)
         self.assertTrue(in_flight.task.done())
         try:
@@ -2180,10 +2277,14 @@ class BaseCacheTests:
             calls += 1
             return "value"
 
-        in_flight = _AsyncInFlightGeneration(
-            cache._aget_or_set_generate("key", default, DEFAULT_TIMEOUT, None)
+        made_key = cache.make_key("key")
+        in_flight = _AsyncInFlightGeneration()
+        cache._aget_or_set_in_flight[made_key] = in_flight
+        in_flight.start(
+            cache._aget_or_set_generate(
+                "key", default, DEFAULT_TIMEOUT, None, made_key, in_flight
+            )
         )
-        cache._aget_or_set_in_flight[cache.make_key("key")] = in_flight
         await self._wait_for_generation_task(in_flight.task)
         self.assertTrue(in_flight.task.done())
         # The committed value is observed without running the default again.

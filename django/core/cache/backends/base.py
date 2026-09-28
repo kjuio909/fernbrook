@@ -1,6 +1,7 @@
 "Base Cache class."
 
 import asyncio
+import contextlib
 import inspect
 import threading
 import time
@@ -67,6 +68,13 @@ class _AsyncInFlightGeneration:
     cancelling one waiter cannot cancel a generation that still has
     participants.
 
+    The round is created in two steps: the instance is constructed and
+    published in the registry, then :meth:`start` schedules its task, so the
+    registry always knows the round before the generation begins. The
+    generation can then fence its own commit on that registry: a round that
+    was retired by an explicit delete, a clear, or a vanished repopulating
+    value never gets to resurrect the entry with a stale result.
+
     ``participants`` counts callers that have joined the round and not yet left
     it. When it reaches zero the round is detached from the registry before
     the generation task is abandoned, so a cancelled round can never be
@@ -76,8 +84,8 @@ class _AsyncInFlightGeneration:
 
     __slots__ = ("task", "participants", "repopulated")
 
-    def __init__(self, coro):
-        self.task = asyncio.ensure_future(coro)
+    def __init__(self):
+        self.task = None
         self.participants = 1
         # True once a value is unconditionally stored for the entry while
         # this round is in flight (via set()/set_many()). Such a value may
@@ -86,6 +94,10 @@ class _AsyncInFlightGeneration:
         # though this generation is still running. That later miss must
         # start a fresh round instead of joining this one.
         self.repopulated = False
+
+    def start(self, coro):
+        self.task = asyncio.ensure_future(coro)
+        return self
 
     def join(self):
         self.participants += 1
@@ -165,6 +177,13 @@ class BaseCache:
         # constructed cache key so that versions (and custom key functions)
         # are treated as distinct cache entries.
         self._aget_or_set_in_flight = {}
+        # Serializes registry detachments (delete()/clear()/participant
+        # unwind) against the generation's own commit check. The check and a
+        # NX insertion run inside this lock in the thread-sensitive executor,
+        # and deletions detach under it before removing the entry, so a
+        # retired round can neither resurrect an entry nor race a fresh
+        # round's generation.
+        self._aget_or_set_lock = threading.RLock()
         # In-flight get_or_set() default generations, likewise keyed by the
         # fully constructed cache key. Each entry is an _InFlightGeneration
         # shared by all threads coalescing on the same cache entry.
@@ -373,23 +392,30 @@ class BaseCache:
         # Coalesce concurrent misses for the same cache entry: only one
         # generation runs per round, and every participant observes its very
         # same value or failure. Different keys (including different versions)
-        # have separate rounds and never block each other. The registry is
-        # only touched at synchronous points here, so it needs no lock.
-        in_flight = self._aget_or_set_in_flight.get(made_key)
-        if in_flight is not None and in_flight.task.done():
-            # The registered round already reached its outcome but its
-            # participants haven't finished unwinding, so it hasn't been
-            # cleaned up yet. A new miss request must not join a finished
-            # round — inheriting a stale failure (or an uncommitted result)
-            # would make the outcome depend on event loop scheduling. Retire
-            # the round now so this call re-determines the state of the
-            # cache entry from scratch. The finished round's participants
-            # still hold their own reference to it and observe its outcome;
-            # the identity checks below keep their cleanup away from the
-            # round started here.
-            self._aget_or_set_in_flight.pop(made_key, None)
-            _discard_generation_result(in_flight.task)
-            in_flight = None
+        # have separate rounds and never block each other. Registry access is
+        # guarded by a lock because synchronous operations (delete()/clear(),
+        # which run in the thread-sensitive executor or a caller thread) touch
+        # it concurrently with this coroutine.
+        with self._aget_or_set_lock:
+            in_flight = self._aget_or_set_in_flight.get(made_key)
+            if (
+                in_flight is not None
+                and in_flight.task is not None
+                and in_flight.task.done()
+            ):
+                # The registered round already reached its outcome but its
+                # participants haven't finished unwinding, so it hasn't been
+                # cleaned up yet. A new miss request must not join a finished
+                # round — inheriting a stale failure (or an uncommitted result)
+                # would make the outcome depend on event loop scheduling. Retire
+                # the round now so this call re-determines the state of the
+                # cache entry from scratch. The finished round's participants
+                # still hold their own reference to it and observe its outcome;
+                # the identity checks below keep their cleanup away from the
+                # round started here.
+                self._aget_or_set_in_flight.pop(made_key, None)
+                _discard_generation_result(in_flight.task)
+                in_flight = None
         if in_flight is not None:
             if not in_flight.repopulated:
                 # No value was stored for the entry while this round is in
@@ -406,35 +432,44 @@ class BaseCache:
                 # has since been deleted or expired this miss describes a
                 # newer state of the entry than the running generation.
                 val = await self.aget(key, self._missing_key, version=version)
-                current = self._aget_or_set_in_flight.get(made_key)
-                if current is in_flight:
-                    if val is not self._missing_key:
-                        return val
-                    # The repopulating value vanished -- it expired -- so
-                    # detach the old round (it keeps running for its existing
-                    # participants) and start a fresh one below.
-                    self._aget_or_set_in_flight.pop(made_key, None)
-                    if in_flight.task.done():
-                        _discard_generation_result(in_flight.task)
-                    in_flight = None
-                elif current is None:
-                    # The round was retired while the read was in flight (an
-                    # explicit delete or the round's last participant
-                    # unwound). A live value needs no generation; a miss
-                    # starts a fresh round from scratch.
-                    if val is not self._missing_key:
-                        return val
-                    in_flight = None
-                else:
-                    # A newer round already took over and re-determined the
-                    # state of the entry when it started; coalesce onto it.
-                    in_flight = current
-                    in_flight.join()
+                with self._aget_or_set_lock:
+                    current = self._aget_or_set_in_flight.get(made_key)
+                    if current is in_flight:
+                        if val is not self._missing_key:
+                            return val
+                        # The repopulating value vanished -- deleted or expired
+                        # -- so detach the old round (it keeps running for its
+                        # existing participants, but its commit is now fenced
+                        # off) and start a fresh one below.
+                        self._aget_or_set_in_flight.pop(made_key, None)
+                        if in_flight.task.done():
+                            _discard_generation_result(in_flight.task)
+                        in_flight = None
+                    elif current is None:
+                        # The round was retired while the read was in flight (an
+                        # explicit delete or the round's last participant
+                        # unwound). A live value needs no generation; a miss
+                        # starts a fresh round from scratch.
+                        if val is not self._missing_key:
+                            return val
+                        in_flight = None
+                    else:
+                        # A newer round already took over and re-determined the
+                        # state of the entry when it started; coalesce onto it.
+                        in_flight = current
+                        in_flight.join()
         if in_flight is None:
-            in_flight = _AsyncInFlightGeneration(
-                self._aget_or_set_generate(key, default, timeout, version)
+            # Publish the round before scheduling the generation task so the
+            # generation always fences its commit against the registry it was
+            # published in.
+            in_flight = _AsyncInFlightGeneration()
+            with self._aget_or_set_lock:
+                self._aget_or_set_in_flight[made_key] = in_flight
+            in_flight.start(
+                self._aget_or_set_generate(
+                    key, default, timeout, version, made_key, in_flight
+                )
             )
-            self._aget_or_set_in_flight[made_key] = in_flight
         try:
             # Shield the shared generation task from this participant's
             # cancellation. Whether a still-running generation is abandoned
@@ -442,28 +477,33 @@ class BaseCache:
             # participant's cancellation.
             return await asyncio.shield(in_flight.task)
         finally:
-            in_flight.participants -= 1
-            task = in_flight.task
-            if task.done():
-                # The round reached an outcome. Only detach the generation of
-                # the current round (identity checked), so a round that
-                # started after the outcome became visible is untouched.
-                if self._aget_or_set_in_flight.get(made_key) is in_flight:
-                    self._aget_or_set_in_flight.pop(made_key, None)
-                    _discard_generation_result(task)
-            elif in_flight.participants == 0:
-                # The last participant left while the generation was still
-                # running, which can only be its own cancellation. Detach the
-                # round from the registry before abandoning it, so the next
-                # caller starts a fresh round and can never observe this one.
-                # The generation never deletes entries, so a value committed
-                # by another writer is left in place.
-                if self._aget_or_set_in_flight.get(made_key) is in_flight:
-                    self._aget_or_set_in_flight.pop(made_key, None)
-                task.add_done_callback(_discard_generation_result)
-                task.cancel()
+            with self._aget_or_set_lock:
+                in_flight.participants -= 1
+                task = in_flight.task
+                if task.done():
+                    # The round reached an outcome. Only detach the generation
+                    # of the current round (identity checked), so a round that
+                    # started after the outcome became visible is untouched.
+                    if self._aget_or_set_in_flight.get(made_key) is in_flight:
+                        self._aget_or_set_in_flight.pop(made_key, None)
+                        _discard_generation_result(task)
+                elif in_flight.participants == 0:
+                    # The last participant left while the generation was still
+                    # running, which can only be its own cancellation. Detach
+                    # the round from the registry before abandoning it, so the
+                    # next caller starts a fresh round and can never observe
+                    # this one. Detaching also fences the abandoned
+                    # generation's commit, so it can't resurrect an entry that
+                    # was deleted meanwhile; a value committed by another
+                    # writer is left in place.
+                    if self._aget_or_set_in_flight.get(made_key) is in_flight:
+                        self._aget_or_set_in_flight.pop(made_key, None)
+                    task.add_done_callback(_discard_generation_result)
+                    task.cancel()
 
-    async def _aget_or_set_generate(self, key, default, timeout, version):
+    async def _aget_or_set_generate(
+        self, key, default, timeout, version, made_key, in_flight
+    ):
         val = await self.aget(key, self._missing_key, version=version)
         if val is not self._missing_key:
             # The entry was populated before this generation started; return
@@ -471,11 +511,45 @@ class BaseCache:
             return val
         if callable(default):
             default = await self._acall_default(default)
-        await self.aadd(key, default, timeout=timeout, version=version)
-        # Fetch the value again to avoid a race condition if another writer
-        # added a value between the first aget() and the aadd() above: the
-        # value already in the cache wins and must not be overwritten.
-        return await self.aget(key, default, version=version)
+        await self._aget_or_set_commit(
+            key, default, timeout, version, made_key, in_flight
+        )
+        val = await self.aget(key, self._missing_key, version=version)
+        if val is not self._missing_key:
+            return val
+        # The round was retired (deleted/cleared/all-cancelled), or fenced off
+        # by a repopulating write that has since vanished, so this round's
+        # value is not stored. Participants still receive the value they
+        # waited for, exactly as with a zero timeout; the cache entry stays
+        # unreadable and the next miss regenerates from scratch.
+        return default
+
+    async def _aget_or_set_commit(
+        self, key, value, timeout, version, made_key, in_flight
+    ):
+        """
+        Conditionally commit a generated value.
+
+        Run the registry fence and the NX insertion as one thread-sensitive
+        job so they are atomic with respect to delete()/clear() (which detach
+        the round and remove the entry in the same executor): only the round
+        currently registered for the entry may insert, a retired or
+        superseded round never inserts, and an insertion followed by a delete
+        is undone by that delete.
+        """
+
+        def _commit():
+            with self._aget_or_set_lock:
+                current = self._aget_or_set_in_flight.get(made_key)
+                if current is not in_flight or in_flight.repopulated:
+                    # This round was retired (deleted/cleared/all-cancelled),
+                    # a newer round took over, or an unconditional write
+                    # superseded it: don't insert, so a stale result can't
+                    # overwrite the newer state or resurrect a vanished entry.
+                    return
+                self.add(key, value, timeout=timeout, version=version)
+
+        await sync_to_async(_commit, thread_sensitive=True)()
 
     async def _acall_default(self, default):
         result = default()
@@ -483,23 +557,60 @@ class BaseCache:
             result = await result
         return result
 
-    def _retire_aget_or_set_in_flight(self, key, version=None):
+    @contextlib.contextmanager
+    def _retiring_aget_or_set(self, key, version=None):
         """
-        Retire any in-flight aget_or_set() generation round for the key.
+        Context manager retiring the in-flight aget_or_set() round for *key*.
 
         Deleting the entry invalidates the round that was generating its
         value: a later miss must confirm the state of the cache entry from
         scratch instead of joining a round whose outcome predates the
-        deletion. Only the round registered right now is retired; a round
-        started after the deletion is untouched. The detached round keeps
-        running for its remaining participants, who still share its
-        outcome, but its late result can no longer be observed by new
-        callers, and its commit (an add()) can't overwrite a value written
-        after this point.
+        deletion. The round is detached while holding the coordination lock
+        and the backend removal runs while it is still held, so a detached
+        generation's commit (an add()) can neither race the removal nor
+        resurrect the deleted entry. Only the round registered right now is
+        retired; a round started afterwards is untouched. The detached round
+        keeps running for its remaining participants, who still share its
+        outcome, but its late result can no longer be observed by new callers.
+
+        Yields the fully constructed cache key.
         """
-        made_key = self.make_key(key, version=version)
-        in_flight = self._aget_or_set_in_flight.pop(made_key, None)
-        if in_flight is not None and in_flight.task.done():
+        made_key = self.make_and_validate_key(key, version=version)
+        with self._aget_or_set_lock:
+            in_flight = self._aget_or_set_in_flight.pop(made_key, None)
+            self._discard_finished_generation(in_flight)
+            yield made_key
+
+    @contextlib.contextmanager
+    def _retiring_all_aget_or_set(self):
+        """
+        Context manager retiring every in-flight aget_or_set() round.
+
+        Clearing the cache removes every entry at once, so no registered
+        round can still describe a live entry; new calls must re-determine
+        misses from scratch. The rounds are detached while holding the
+        coordination lock and the backend clearing runs while it is still
+        held, so detached generations cannot repopulate the cleared cache.
+        Detached rounds keep running for their remaining participants.
+        """
+        with self._aget_or_set_lock:
+            self._retire_aget_or_set_all_locked()
+            yield
+
+    def _retire_aget_or_set_all_locked(self):
+        """Detach every registered round. The coordination lock is held."""
+        in_flights = list(self._aget_or_set_in_flight.values())
+        self._aget_or_set_in_flight.clear()
+        for in_flight in in_flights:
+            self._discard_finished_generation(in_flight)
+
+    @staticmethod
+    def _discard_finished_generation(in_flight):
+        if (
+            in_flight is not None
+            and in_flight.task is not None
+            and in_flight.task.done()
+        ):
             _discard_generation_result(in_flight.task)
 
     def _note_aget_or_set_repopulation(self, made_key):
@@ -507,29 +618,16 @@ class BaseCache:
         Note that a value was unconditionally stored for the entry while a
         generation round may be in flight (via set()/set_many()).
 
-        Such a value is independent of the generation's own add() commit. If
-        it has vanished by the time a later miss request reads the entry --
-        deleted, reaped as expired, or expired server-side -- that request
-        must start a fresh round instead of joining the still-running one.
+        Such a value is independent of the generation's own add() commit. It
+        wins for the whole round, and once such a write happened the round's
+        commit is fenced off permanently, so if the value later vanishes --
+        deleted, reaped as expired, or expired server-side -- the generation
+        can't resurrect it and a later miss starts a fresh round.
         """
-        in_flight = self._aget_or_set_in_flight.get(made_key)
-        if in_flight is not None:
-            in_flight.repopulated = True
-
-    def _retire_all_aget_or_set_in_flight(self):
-        """
-        Retire every in-flight aget_or_set() generation round.
-
-        Clearing the cache removes every entry at once, so no registered
-        round can still describe a live entry; new calls must re-determine
-        misses from scratch. Detached rounds keep running for their
-        remaining participants.
-        """
-        in_flights = list(self._aget_or_set_in_flight.values())
-        self._aget_or_set_in_flight.clear()
-        for in_flight in in_flights:
-            if in_flight.task.done():
-                _discard_generation_result(in_flight.task)
+        with self._aget_or_set_lock:
+            in_flight = self._aget_or_set_in_flight.get(made_key)
+            if in_flight is not None:
+                in_flight.repopulated = True
 
     def has_key(self, key, version=None):
         """

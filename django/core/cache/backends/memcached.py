@@ -92,9 +92,8 @@ class BaseMemcachedCache(BaseCache):
         return bool(self._cache.touch(key, self.get_backend_timeout(timeout)))
 
     def delete(self, key, version=None):
-        self._retire_aget_or_set_in_flight(key, version)
-        key = self.make_and_validate_key(key, version=version)
-        return bool(self._cache.delete(key))
+        with self._retiring_aget_or_set(key, version) as made_key:
+            return bool(self._cache.delete(made_key))
 
     def get_many(self, keys, version=None):
         key_map = {
@@ -140,14 +139,17 @@ class BaseMemcachedCache(BaseCache):
         return [original_keys[k] for k in failed_keys]
 
     def delete_many(self, keys, version=None):
-        for key in keys:
-            self._retire_aget_or_set_in_flight(key, version)
-        keys = [self.make_and_validate_key(key, version=version) for key in keys]
-        self._cache.delete_multi(keys)
+        made_keys = [self.make_and_validate_key(key, version=version) for key in keys]
+        with self._aget_or_set_lock:
+            for made_key in made_keys:
+                self._discard_finished_generation(
+                    self._aget_or_set_in_flight.pop(made_key, None)
+                )
+            self._cache.delete_multi(made_keys)
 
     def clear(self):
-        self._retire_all_aget_or_set_in_flight()
-        self._cache.flush_all()
+        with self._retiring_all_aget_or_set():
+            self._cache.flush_all()
 
     def validate_key(self, key):
         for warning in memcache_key_warnings(key):
