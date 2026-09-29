@@ -281,6 +281,17 @@ Forms
   instance share a single cleaning round; if every caller is cancelled the
   unfinished round is discarded and the next call retries from scratch.
 
+* :meth:`.BaseFormSet.is_valid` now has an asynchronous counterpart,
+  :meth:`~django.forms.formsets.BaseFormSet.ais_valid`, for use in ASGI
+  views. The management form, every child form and the formset-wide
+  ``clean()`` hook follow the same order and semantics as the synchronous
+  path; awaitable results returned by child validators, child ``clean()``
+  hooks or the formset ``clean()`` hook are awaited, while plain values are
+  not. As with forms, concurrent ``ais_valid()`` calls on an unchanged
+  snapshot share one cleaning round, and a round whose callers are all
+  cancelled is discarded without publishing partial errors or cleaned
+  data.
+
 * The new asset object :class:`~django.forms.Stylesheet` is available for
   adding custom HTML-attributes to stylesheet links in form media. See
   :ref:`paths as objects <form-media-asset-objects>` for more details.
