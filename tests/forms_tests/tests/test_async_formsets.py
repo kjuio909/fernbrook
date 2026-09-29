@@ -588,6 +588,188 @@ class AsyncFormSetConcurrencyTests(SimpleTestCase):
         self.assertEqual(formset.cleaned_data[0]["name"], "in-flight")
 
 
+class AsyncFormSetRoundConfigTests(SimpleTestCase):
+    """A round keeps the configuration captured when it started.
+
+    Mutating deletion/ordering switches, the count limits or the validation
+    toggles while a round is blocked inside an async validator must not
+    change the participating rows, deletion decisions, ordering, count errors
+    or formset-wide cleaning of the round already in flight; the next call
+    builds a new snapshot from the live configuration.
+    """
+
+    def _gated_field(self, started, gate, *, failure=None):
+        async def gated(value):
+            started.set()
+            await gate.wait()
+            if failure is not None:
+                raise ValidationError(failure)
+
+        class F(Form):
+            name = CharField(validators=[gated])
+
+        return F
+
+    async def test_can_delete_change_mid_flight_keeps_old_round(self):
+        started = asyncio.Event()
+        gate = asyncio.Event()
+        F = self._gated_field(started, gate, failure="child-bad")
+        # The initial form is marked for deletion, so under the round's
+        # snapshot (can_delete=True) its child error is ignored.
+        formset = formset_factory(F, can_delete=True, extra=0)(
+            formset_data([{"name": "x"}], total=1, initial=1, delete=(0,))
+        )
+        task = asyncio.create_task(formset.ais_valid())
+        await started.wait()
+        formset.can_delete = False
+        gate.set()
+        self.assertIs(await task, True)
+        # The deleted form's error stays omitted from the published result.
+        self.assertEqual(formset.errors, [])
+        self.assertEqual(list(formset.non_form_errors().as_data()), [])
+        # A later call snapshots the new configuration: deletion no longer
+        # hides the child error.
+        self.assertIs(await formset.ais_valid(), False)
+        self.assertIn("child-bad", str(formset.errors[0]["name"]))
+
+    async def test_validate_min_change_mid_flight_keeps_old_round(self):
+        started = asyncio.Event()
+        gate = asyncio.Event()
+        F = self._gated_field(started, gate)
+        formset = formset_factory(F, extra=0, min_num=0)(
+            formset_data([{"name": "a"}])
+        )
+        task = asyncio.create_task(formset.ais_valid())
+        await started.wait()
+        formset.min_num = 2
+        formset.validate_min = True
+        gate.set()
+        self.assertIs(await task, True)
+        self.assertEqual(
+            [error.code for error in formset.non_form_errors().as_data()], []
+        )
+        # The next round validates against the raised minimum.
+        self.assertIs(await formset.ais_valid(), False)
+        self.assertEqual(
+            [error.code for error in formset.non_form_errors().as_data()],
+            ["too_few_forms"],
+        )
+
+    async def test_validate_max_change_mid_flight_keeps_old_round(self):
+        started = asyncio.Event()
+        gate = asyncio.Event()
+        F = self._gated_field(started, gate)
+        formset = formset_factory(
+            F, extra=0, max_num=1, validate_max=True, absolute_max=10
+        )(formset_data([{"name": "a"}, {"name": "b"}]))
+        task = asyncio.create_task(formset.ais_valid())
+        await started.wait()
+        # Relaxing the limit after the round started cannot remove its
+        # too-many-forms error.
+        formset.max_num = 5
+        formset.validate_max = False
+        gate.set()
+        self.assertIs(await task, False)
+        self.assertEqual(
+            [error.code for error in formset.non_form_errors().as_data()],
+            ["too_many_forms"],
+        )
+
+    async def test_can_order_change_mid_flight_keeps_old_round(self):
+        started = asyncio.Event()
+        gate = asyncio.Event()
+        seen = []
+        F = self._gated_field(started, gate)
+
+        class Base(BaseFormSet):
+            async def clean(self):
+                # Inside the round ordering is still enabled with its
+                # snapshot ORDER values, despite the live switch below.
+                seen.append(
+                    [form.cleaned_data["name"] for form in self.ordered_forms]
+                )
+
+        formset = formset_factory(F, formset=Base, can_order=True, extra=0)(
+            formset_data([{"name": "a"}, {"name": "b"}], order=("2", "1"))
+        )
+        task = asyncio.create_task(formset.ais_valid())
+        await started.wait()
+        formset.can_order = False
+        gate.set()
+        self.assertIs(await task, True)
+        self.assertEqual(seen, [["b", "a"]])
+
+    async def test_concurrent_callers_share_fixed_configuration(self):
+        started = asyncio.Event()
+        gate = asyncio.Event()
+        F = self._gated_field(started, gate, failure="child-bad")
+        formset = formset_factory(F, can_delete=True, extra=0)(
+            formset_data([{"name": "x"}], total=1, initial=1, delete=(0,))
+        )
+        tasks = [asyncio.create_task(formset.ais_valid()) for _ in range(3)]
+        await started.wait()
+        formset.can_delete = False
+        gate.set()
+        self.assertEqual(await asyncio.gather(*tasks), [True, True, True])
+
+    async def test_published_state_gated_by_published_config_mid_flight(self):
+        gates = [asyncio.Event(), asyncio.Event()]
+        gates[0].set()
+        started = asyncio.Event()
+        phase = [0]
+
+        async def gated(value):
+            if phase[0] == 0:
+                await gates[0].wait()
+            else:
+                started.set()
+                await gates[1].wait()
+
+        class F(Form):
+            name = CharField(validators=[gated])
+
+        formset = formset_factory(F, can_delete=True, extra=1)(
+            formset_data(
+                [{"name": "old"}, {"name": "extra"}],
+                total=2,
+                initial=1,
+                delete=(0,),
+            )
+        )
+        self.assertIs(await formset.ais_valid(), True)
+        self.assertEqual(
+            [form.cleaned_data["name"] for form in formset.deleted_forms],
+            ["old"],
+        )
+        # Ordering was disabled when the result was published.
+        with self.assertRaises(AttributeError):
+            formset.ordered_forms
+
+        # A new round over changed inputs; flip the switches while it blocks.
+        phase[0] = 1
+        formset.data = formset_data([{"name": "new"}, {"name": "x"}], total=2)
+        formset.can_delete = False
+        formset.can_order = True
+        task = asyncio.create_task(formset.ais_valid())
+        await started.wait()
+        # External reads during the round still see the published result
+        # presented under the published configuration.
+        self.assertEqual(
+            [form.cleaned_data["name"] for form in formset.deleted_forms],
+            ["old"],
+        )
+        with self.assertRaises(AttributeError):
+            formset.ordered_forms
+        gates[1].set()
+        self.assertIs(await task, True)
+        # Once the new round publishes, the new configuration governs.
+        self.assertEqual(formset.deleted_forms, [])
+        self.assertEqual(
+            [form.cleaned_data["name"] for form in formset.ordered_forms],
+            ["new", "x"],
+        )
+
+
 class AsyncFormSetCacheTests(SimpleTestCase):
     async def test_repeated_calls_run_child_validators_once(self):
         calls = []

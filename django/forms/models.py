@@ -712,6 +712,49 @@ class BaseModelFormSet(BaseFormSet, AltersData):
             }
         )
 
+    @property
+    def queryset(self):
+        # The task running an asynchronous round cleans against the raw
+        # queryset captured when the round started; everyone else sees the
+        # live one. The ordered, evaluated copy lives in get_queryset()'s
+        # cache (state.resolved_queryset / self._resolved_queryset).
+        state = self._active_round_state()
+        if state is not None:
+            return state.config["queryset"]
+        return self.__dict__.get("_queryset")
+
+    @queryset.setter
+    def queryset(self, queryset):
+        self._queryset = queryset
+        # Replacing the configured queryset invalidates the materialized
+        # ordering cache.
+        self.__dict__.pop("_resolved_queryset", None)
+
+    @property
+    def instance(self):
+        # Related parent instance (inline formsets), fixed for a running
+        # round. Plain model formsets never set it and see None.
+        state = self._active_round_state()
+        if state is not None:
+            return state.config["instance"]
+        return self.__dict__.get("_instance")
+
+    @instance.setter
+    def instance(self, instance):
+        self._instance = instance
+
+    @property
+    def save_as_new(self):
+        # Round-fixed inline flag controlling initial_form_count().
+        state = self._active_round_state()
+        if state is not None:
+            return state.config["save_as_new"]
+        return self.__dict__.get("_save_as_new", False)
+
+    @save_as_new.setter
+    def save_as_new(self, save_as_new):
+        self._save_as_new = save_as_new
+
     def initial_form_count(self):
         """Return the number of forms that are required in this FormSet."""
         if not self.is_bound:
@@ -719,6 +762,11 @@ class BaseModelFormSet(BaseFormSet, AltersData):
         return super().initial_form_count()
 
     def _existing_object(self, pk):
+        state = self._active_round_state()
+        if state is not None:
+            if state.object_dict is None:
+                state.object_dict = {o.pk: o for o in self.get_queryset()}
+            return state.object_dict.get(pk)
         if not hasattr(self, "_object_dict"):
             self._object_dict = {o.pk: o for o in self.get_queryset()}
         return self._object_dict.get(pk)
@@ -767,7 +815,23 @@ class BaseModelFormSet(BaseFormSet, AltersData):
         return form
 
     def get_queryset(self):
-        if not hasattr(self, "_queryset"):
+        state = self._active_round_state()
+        if state is not None:
+            # Materialize the round's queryset once, keeping it off the live
+            # formset cache so a queryset replaced mid-round is invisible.
+            if state.resolved_queryset is None:
+                if self.queryset is None:
+                    qs = self.model._default_manager.get_queryset()
+                else:
+                    qs = self.queryset
+                if not qs.totally_ordered:
+                    current_ordering = (
+                        qs.query.order_by or qs.model._meta.ordering or []
+                    )
+                    qs = qs.order_by(*current_ordering, "pk")
+                state.resolved_queryset = qs
+            return state.resolved_queryset
+        if "_resolved_queryset" not in self.__dict__:
             if self.queryset is not None:
                 qs = self.queryset
             else:
@@ -783,8 +847,8 @@ class BaseModelFormSet(BaseFormSet, AltersData):
             # Removed queryset limiting here. As per discussion re: #13023
             # on django-dev, max_num should not prevent existing
             # related objects/inlines from being displayed.
-            self._queryset = qs
-        return self._queryset
+            self._resolved_queryset = qs
+        return self._resolved_queryset
 
     def save_new(self, form, commit=True):
         """Save and return a new model instance for the given form."""

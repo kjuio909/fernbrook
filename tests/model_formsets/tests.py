@@ -2595,3 +2595,48 @@ class AsyncModelFormSetTests(TestCase):
         formset.data = self._data(["Arthur Rimbaud"])
         self.assertIs(await formset.ais_valid(), True)
         self.assertEqual(formset.cleaned_data[0]["name"], "Arthur Rimbaud")
+
+    async def test_queryset_change_mid_flight_keeps_old_round(self):
+        started = asyncio.Event()
+        gate = asyncio.Event()
+        seen = []
+
+        async def gated(value):
+            started.set()
+            await gate.wait()
+
+        class AuthorForm(ModelForm):
+            name = forms.CharField(validators=[gated])
+
+            class Meta:
+                model = Author
+                fields = "__all__"
+
+        class Base(BaseModelFormSet):
+            async def clean(self):
+                # Read from within the round after the live queryset has been
+                # swapped: the round keeps the queryset it started with.
+                seen.append(self.get_queryset().query.is_empty())
+
+        AuthorFormSet = modelformset_factory(
+            Author, form=AuthorForm, formset=Base, extra=1
+        )
+        author = await Author.objects.acreate(name="Snapshot Author")
+        formset = AuthorFormSet(
+            data=self._data(["posted name"]),
+            queryset=Author.objects.filter(pk=author.pk),
+        )
+        self.assertIs(formset.get_queryset().query.is_empty(), False)
+        task = asyncio.create_task(formset.ais_valid())
+        await started.wait()
+        # Replace the live queryset while the round is blocked in a validator.
+        formset.queryset = Author.objects.none()
+        gate.set()
+        self.assertIs(await task, True)
+        # The in-round clean() still resolved the queryset captured when the
+        # round started (not the empty replacement queryset).
+        self.assertEqual(seen, [False])
+
+        # A later round cleans against the replacement queryset.
+        self.assertIs(await formset.ais_valid(), True)
+        self.assertEqual(seen, [False, True])

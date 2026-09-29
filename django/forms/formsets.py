@@ -32,6 +32,54 @@ DEFAULT_MIN_NUM = 0
 # default maximum number of forms in a formset, to prevent memory exhaustion
 DEFAULT_MAX_NUM = 1000
 
+# Configuration attributes that define a cleaning round besides the bound
+# inputs. While an asynchronous round is running they resolve to the values
+# captured when the round started, so toggling deletion/ordering, the count
+# limits or the validation switches after a round begins cannot change the
+# participating rows, deletion/ordering decisions or count errors of the
+# round already in flight.
+_ROUND_CONFIG_ATTRS = (
+    "extra",
+    "can_order",
+    "can_delete",
+    "can_delete_extra",
+    "min_num",
+    "max_num",
+    "absolute_max",
+    "validate_min",
+    "validate_max",
+)
+
+
+class _RoundConfig:
+    """A configuration attribute fixed for the lifetime of a validation round.
+
+    Reads on the task running an asynchronous round return the value captured
+    in the round snapshot; every other reader sees the live (instance or
+    class) value. Assignments always update the live value, which the next
+    round snapshots.
+    """
+
+    def __init__(self, name, default=None):
+        self.name = name
+        self.default = default
+
+    def __get__(self, instance, owner=None):
+        if instance is None:
+            # Class-level introspection (e.g. ``FormSet.max_num``) sees the
+            # factory/class default carried by this descriptor.
+            return self.default
+        state = instance._active_round_state()
+        if state is not None:
+            return state.config[self.name]
+        try:
+            return instance.__dict__[self.name]
+        except KeyError:
+            return self.default
+
+    def __set__(self, instance, value):
+        instance.__dict__[self.name] = value
+
 
 class ManagementForm(Form):
     """
@@ -65,7 +113,7 @@ class _AsyncFormSetValidationState:
     formset-wide cleaning each run only once per round.
     """
 
-    def __init__(self, *, epoch, is_bound, inputs, fingerprint):
+    def __init__(self, *, epoch, is_bound, inputs, fingerprint, config):
         self.runner_task = None
         # Number of ais_valid() callers currently awaiting the runner task.
         self.waiters = 0
@@ -83,6 +131,10 @@ class _AsyncFormSetValidationState:
         self.epoch = epoch
         # Whether the formset was bound when the round started.
         self.is_bound = is_bound
+        # Round-fixed configuration (deletion/ordering switches, extra rows,
+        # count limits and validation toggles, plus the model-formset
+        # queryset/instance) captured before the runner starts.
+        self.config = config
         # Detached snapshots the round cleans against. Inputs rebound or
         # mutated after the round started cannot reach the runner.
         self.data = inputs[0]
@@ -119,6 +171,11 @@ class _AsyncFormSetValidationState:
         # Sorted (form index, order value) list when ordering is enabled;
         # None until ordered_forms is first consulted.
         self.ordering = None
+        # Model-formset only: the ordered initial queryset and primary-key to
+        # object mapping materialized for this round, kept off the live
+        # formset so replacing its queryset mid-round cannot reach the runner.
+        self.resolved_queryset = None
+        self.object_dict = None
         # The business result of a completed round, shared with every waiter
         # so callers observe one identical conclusion even if the formset is
         # re-validated or reset between the runner finishing and the waiters
@@ -155,6 +212,18 @@ class BaseFormSet(RenderableFormMixin):
     template_name_table = "django/forms/formsets/table.html"
     template_name_ul = "django/forms/formsets/ul.html"
 
+    # Round-fixed configuration with factory defaults; formset_factory()
+    # replaces these with descriptors carrying the requested values.
+    extra = _RoundConfig("extra", 1)
+    can_order = _RoundConfig("can_order", False)
+    can_delete = _RoundConfig("can_delete", False)
+    can_delete_extra = _RoundConfig("can_delete_extra", True)
+    min_num = _RoundConfig("min_num", DEFAULT_MIN_NUM)
+    max_num = _RoundConfig("max_num", DEFAULT_MAX_NUM)
+    absolute_max = _RoundConfig("absolute_max", None)
+    validate_min = _RoundConfig("validate_min", False)
+    validate_max = _RoundConfig("validate_max", False)
+
     def __init__(
         self,
         data=None,
@@ -189,6 +258,13 @@ class BaseFormSet(RenderableFormMixin):
         # Fingerprint of the inputs used by the last successfully completed
         # validation round, for reuse checks.
         self._validation_fingerprint = None
+        # Configuration captured by the last published validation (a
+        # synchronous full_clean() or a completed async round). While a new
+        # round is in flight, external readers gate the published derived
+        # results (deleted_forms, ordered_forms) against it, so toggling a
+        # switch mid-round cannot change how the already-published state is
+        # presented.
+        self._published_config = None
         # Bumped by every synchronous full_clean(). An async round whose
         # epoch no longer matches keeps serving its own waiters but can never
         # publish, so an async completion can never overwrite a newer
@@ -256,6 +332,18 @@ class BaseFormSet(RenderableFormMixin):
             if current_task is state.runner_task:
                 return state
         return None
+
+    def _active_round_state(self):
+        """Like _current_async_state(), but safe before/super __init__().
+
+        Model formsets assign their queryset and related instance before the
+        ``BaseFormSet`` initializer has installed the round bookkeeping, so
+        their round-aware property getters must treat the formset as having
+        no round at that point.
+        """
+        if not self.__dict__.get("_async_rounds"):
+            return None
+        return self._current_async_state()
 
     @property
     def data(self):
@@ -520,16 +608,25 @@ class BaseFormSet(RenderableFormMixin):
                     state.forms
                 )
             return [state.forms[i] for i in state.deleted_form_indexes]
-        if not self.is_valid() or not self.can_delete:
-            return []
-        # While an async round is in flight this must not be cached against
-        # the live forms; serve the last published cache, otherwise an empty
-        # detached list.
         if self._async_rounds:
+            # Gate the published result against the configuration in force
+            # when it was published, not switches toggled by the round now in
+            # flight.
+            published = self._published_config
+            can_delete = (
+                published["can_delete"] if published is not None else self.can_delete
+            )
+            if not self.is_valid() or not can_delete:
+                return []
+            # While an async round is in flight this must not be cached
+            # against the live forms; serve the last published cache,
+            # otherwise an empty detached list.
             indexes = getattr(self, "_deleted_form_indexes", None)
             if indexes is None:
                 return []
             return [self.forms[i] for i in indexes]
+        if not self.is_valid() or not self.can_delete:
+            return []
         if not hasattr(self, "_deleted_form_indexes"):
             self._deleted_form_indexes = self._compute_deleted_form_indexes(self.forms)
         return [self.forms[i] for i in self._deleted_form_indexes]
@@ -575,18 +672,29 @@ class BaseFormSet(RenderableFormMixin):
             if state.ordering is None:
                 state.ordering = self._compute_ordering(state.forms)
             return [state.forms[i[0]] for i in state.ordering]
-        if not self.is_valid() or not self.can_order:
-            raise AttributeError(
-                "'%s' object has no attribute 'ordered_forms'" % self.__class__.__name__
-            )
-        # While an async round is in flight, don't cache the ordering against
-        # the live forms; serve the last published cache, otherwise an empty
-        # detached list.
         if self._async_rounds:
+            # Gate the published result against the configuration in force
+            # when it was published, not switches toggled by the round now in
+            # flight.
+            published = self._published_config
+            can_order = (
+                published["can_order"] if published is not None else self.can_order
+            )
+            if not self.is_valid() or not can_order:
+                raise AttributeError(
+                    "'%s' object has no attribute 'ordered_forms'"
+                    % self.__class__.__name__
+                )
+            # Don't cache ordering against the live forms; serve the last
+            # published cache, otherwise an empty detached list.
             ordering = getattr(self, "_ordering", None)
             if ordering is None:
                 return []
             return [self.forms[i[0]] for i in ordering]
+        if not self.is_valid() or not self.can_order:
+            raise AttributeError(
+                "'%s' object has no attribute 'ordered_forms'" % self.__class__.__name__
+            )
         # Construct _ordering, which is a list of (form_index,
         # order_field_value) tuples. After constructing this list, we'll sort
         # it by order_field_value so we have a way to get to the form indexes
@@ -850,6 +958,19 @@ class BaseFormSet(RenderableFormMixin):
             dict(form_kwargs),
         )
 
+    def _snapshot_round_config(self):
+        """Configuration captured for the lifetime of one validation round.
+
+        Besides the factory settings, model formsets depend on the queryset
+        defining the initial forms and (for inline formsets) the related
+        instance and ``save_as_new`` flag; they are captured too so mutating
+        them while a round is in flight cannot reach the runner.
+        """
+        config = {name: getattr(self, name) for name in _ROUND_CONFIG_ATTRS}
+        for name in ("queryset", "instance", "save_as_new"):
+            config[name] = getattr(self, name, None)
+        return config
+
     def _initial_fingerprint(self, initial):
         if not initial:
             return ()
@@ -920,15 +1041,18 @@ class BaseFormSet(RenderableFormMixin):
         # The synchronous path never consults the fingerprint itself (it
         # always re-runs), but it lets a later ais_valid() reuse the result.
         self._validation_fingerprint = self._current_validation_fingerprint()
+        self._published_config = self._snapshot_round_config()
 
     def _start_async_validation(self):
         loop = asyncio.get_running_loop()
         inputs = self._snapshot_validation_inputs()
+        config = self._snapshot_round_config()
         state = _AsyncFormSetValidationState(
             is_bound=self.is_bound,
             inputs=inputs,
             fingerprint=self._build_snapshot_fingerprint(inputs),
             epoch=self._validation_epoch,
+            config=config,
         )
         # The round keeps a private management form, private child forms and
         # private staging collections. The formset's last published result
@@ -1120,6 +1244,7 @@ class BaseFormSet(RenderableFormMixin):
                 if state.ordering is not None:
                     self._ordering = state.ordering
             self._validation_fingerprint = state.fingerprint
+            self._published_config = state.config
             self._async_validation = None
         # A detached (superseded) round keeps its conclusion only to serve
         # its own waiters via state.result; it never writes the formset
@@ -1240,15 +1365,15 @@ def formset_factory(
         raise ValueError("'absolute_max' must be greater or equal to 'max_num'.")
     attrs = {
         "form": form,
-        "extra": extra,
-        "can_order": can_order,
-        "can_delete": can_delete,
-        "can_delete_extra": can_delete_extra,
-        "min_num": min_num,
-        "max_num": max_num,
-        "absolute_max": absolute_max,
-        "validate_min": validate_min,
-        "validate_max": validate_max,
+        "extra": _RoundConfig("extra", extra),
+        "can_order": _RoundConfig("can_order", can_order),
+        "can_delete": _RoundConfig("can_delete", can_delete),
+        "can_delete_extra": _RoundConfig("can_delete_extra", can_delete_extra),
+        "min_num": _RoundConfig("min_num", min_num),
+        "max_num": _RoundConfig("max_num", max_num),
+        "absolute_max": _RoundConfig("absolute_max", absolute_max),
+        "validate_min": _RoundConfig("validate_min", validate_min),
+        "validate_max": _RoundConfig("validate_max", validate_max),
         "renderer": renderer,
     }
     form_name = form.__name__
