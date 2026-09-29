@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import re
 from datetime import date
@@ -2476,3 +2477,121 @@ class TestModelFormsetOverridesTroughFormMeta(TestCase):
             formset.empty_form.renderer, ModelFormWithDefaultRenderer.default_renderer
         )
         self.assertIsInstance(formset.renderer, DjangoTemplates)
+
+
+class AsyncModelFormSetTests(TestCase):
+    def _data(self, names, *, total=None, initial=0, delete=()):
+        data = {
+            "form-TOTAL_FORMS": str(total if total is not None else len(names)),
+            "form-INITIAL_FORMS": str(initial),
+            "form-MIN_NUM_FORMS": "0",
+            "form-MAX_NUM_FORMS": "",
+        }
+        for i, name in enumerate(names):
+            data[f"form-{i}-name"] = name
+            if i < initial:
+                data[f"form-{i}-id"] = str(i + 1)
+        for i in delete:
+            data[f"form-{i}-DELETE"] = "on"
+        return data
+
+    async def test_ais_valid_matches_sync(self):
+        # Extra (new) forms exercise ModelForm validation through the async
+        # pipeline without issuing ORM queries.
+        AuthorFormSet = modelformset_factory(Author, fields="__all__", extra=2)
+        data = self._data(["Arthur Rimbaud", ""])
+        async_fs = AuthorFormSet(data=data, queryset=Author.objects.none())
+        sync_fs = AuthorFormSet(data=data, queryset=Author.objects.none())
+        self.assertIs(await async_fs.ais_valid(), sync_fs.is_valid())
+        self.assertEqual(
+            [e.as_json() for e in async_fs.errors],
+            [e.as_json() for e in sync_fs.errors],
+        )
+        self.assertEqual(
+            async_fs.non_form_errors().as_json(),
+            sync_fs.non_form_errors().as_json(),
+        )
+        self.assertEqual(async_fs.cleaned_data, sync_fs.cleaned_data)
+        self.assertEqual(
+            async_fs.cleaned_data[0]["name"], "Arthur Rimbaud"
+        )
+
+    async def test_invalid_model_form_matches_sync(self):
+        AuthorFormSet = modelformset_factory(Author, fields="__all__", extra=1)
+        data = self._data(["x" * 200])
+        async_fs = AuthorFormSet(data=data, queryset=Author.objects.none())
+        sync_fs = AuthorFormSet(data=data, queryset=Author.objects.none())
+        self.assertIs(await async_fs.ais_valid(), False)
+        sync_fs.is_valid()
+        self.assertEqual(
+            [e.as_json() for e in async_fs.errors],
+            [e.as_json() for e in sync_fs.errors],
+        )
+
+    async def test_async_validator_runs_once(self):
+        seen = []
+
+        async def counting(value):
+            seen.append(value)
+            await asyncio.sleep(0)
+
+        class AuthorForm(ModelForm):
+            name = forms.CharField(max_length=100, validators=[counting])
+
+            class Meta:
+                model = Author
+                fields = "__all__"
+
+        AuthorFormSet = modelformset_factory(
+            Author, form=AuthorForm, extra=1
+        )
+        formset = AuthorFormSet(
+            data=self._data(["Charles Baudelaire"]),
+            queryset=Author.objects.none(),
+        )
+        self.assertIs(await formset.ais_valid(), True)
+        await formset.ais_valid()
+        self.assertEqual(seen, ["Charles Baudelaire"])
+
+    async def test_async_formset_clean_sees_child_cleaned_data(self):
+        seen = []
+
+        class Base(BaseModelFormSet):
+            async def clean(self):
+                await asyncio.sleep(0)
+                seen.append([form.cleaned_data["name"] for form in self.forms])
+
+        AuthorFormSet = modelformset_factory(
+            Author, fields="__all__", formset=Base, extra=2
+        )
+        formset = AuthorFormSet(
+            data=self._data(["Charles Baudelaire", "Arthur Rimbaud"]),
+            queryset=Author.objects.none(),
+        )
+        self.assertIs(await formset.ais_valid(), True)
+        self.assertEqual(seen, [["Charles Baudelaire", "Arthur Rimbaud"]])
+
+    async def test_deleted_extra_form_matches_sync(self):
+        AuthorFormSet = modelformset_factory(
+            Author, fields="__all__", extra=2, can_delete=True
+        )
+        data = self._data(["Arthur Rimbaud", "x" * 200], delete=(1,))
+        async_fs = AuthorFormSet(data=data, queryset=Author.objects.none())
+        sync_fs = AuthorFormSet(data=data, queryset=Author.objects.none())
+        self.assertIs(await async_fs.ais_valid(), sync_fs.is_valid())
+        self.assertEqual(
+            [f.cleaned_data for f in async_fs.deleted_forms],
+            [f.cleaned_data for f in sync_fs.deleted_forms],
+        )
+        self.assertEqual(len(async_fs.deleted_forms), 1)
+
+    async def test_changed_inputs_start_new_round(self):
+        AuthorFormSet = modelformset_factory(Author, fields="__all__", extra=1)
+        formset = AuthorFormSet(
+            data=self._data(["Charles Baudelaire"]),
+            queryset=Author.objects.none(),
+        )
+        self.assertIs(await formset.ais_valid(), True)
+        formset.data = self._data(["Arthur Rimbaud"])
+        self.assertIs(await formset.ais_valid(), True)
+        self.assertEqual(formset.cleaned_data[0]["name"], "Arthur Rimbaud")

@@ -281,6 +281,17 @@ Forms
   instance share a single cleaning round; if every caller is cancelled the
   unfinished round is discarded and the next call retries from scratch.
 
+* :meth:`.BaseFormSet.is_valid` now has an asynchronous counterpart,
+  :meth:`~django.forms.BaseFormSet.ais_valid`. It awaits awaitable
+  validators and cleaning hooks on the child forms and an awaitable
+  formset-wide ``clean()``, keeping the management form, deletion and
+  ordering semantics identical to the synchronous path. Child forms are
+  cleaned in declaration order from a snapshot taken when the call began;
+  concurrent calls on the same unchanged snapshot share one run, while
+  changed data, initial data, form counts or field definitions force a fresh
+  snapshot. If every caller is cancelled the unfinished run -- including its
+  temporary errors -- is discarded and retried on the next call.
+
 * The new asset object :class:`~django.forms.Stylesheet` is available for
   adding custom HTML-attributes to stylesheet links in form media. See
   :ref:`paths as objects <form-media-asset-objects>` for more details.

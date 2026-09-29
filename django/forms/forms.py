@@ -48,6 +48,59 @@ def _mapping_fingerprint(mapping):
     return tuple((key, mapping[key]) for key in mapping)
 
 
+def _freeze_fingerprint_value(value):
+    """Return an immutable snapshot of a fingerprint component.
+
+    Mutable containers are copied so later in-place mutations (e.g.
+    appending a validator or updating choices) change the live objects
+    without retroactively changing the stored fingerprint.
+    """
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_fingerprint_value(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_freeze_fingerprint_value(item) for item in value)
+    if isinstance(value, dict):
+        return tuple(
+            (key, _freeze_fingerprint_value(item))
+            for key, item in sorted(value.items(), key=lambda item: str(item[0]))
+        )
+    return value
+
+
+def _field_fingerprint(field):
+    """Structural fingerprint of a field definition.
+
+    Covers every instance attribute (validators, error messages,
+    choices, input formats, coercion callables, subfields and so on) so
+    that configuration changes invalidate a cached round. Mutable
+    attributes are snapshotted; plain callables compare by identity.
+    Nested subfields (ComboField / MultiValueField) and the widget are
+    fingerprinted recursively.
+    """
+    items = []
+    for key, value in vars(field).items():
+        if (
+            key == "fields"
+            and isinstance(value, (list, tuple))
+            and value
+            and all(isinstance(sub, Field) for sub in value)
+        ):
+            value = tuple(_field_fingerprint(sub) for sub in value)
+        elif key == "widget":
+            value = (
+                type(value),
+                _freeze_fingerprint_value(vars(value)),
+            )
+        else:
+            value = _freeze_fingerprint_value(value)
+        items.append((key, value))
+    return tuple(sorted(items, key=lambda item: item[0]))
+
+
+def _fields_fingerprint(fields):
+    return tuple((name, _field_fingerprint(field)) for name, field in fields.items())
+
+
 class DeclarativeFieldsMetaclass(MediaDefiningClass):
     """Collect Fields declared on the base classes."""
 
@@ -521,57 +574,13 @@ class BaseForm(RenderableFormMixin):
         return {name: self._clone_field(field) for name, field in self._fields.items()}
 
     def _freeze_fingerprint_value(self, value):
-        """Return an immutable snapshot of a fingerprint component.
-
-        Mutable containers are copied so later in-place mutations (e.g.
-        appending a validator or updating choices) change the live objects
-        without retroactively changing the stored fingerprint.
-        """
-        if isinstance(value, (list, tuple)):
-            return tuple(self._freeze_fingerprint_value(item) for item in value)
-        if isinstance(value, set):
-            return frozenset(self._freeze_fingerprint_value(item) for item in value)
-        if isinstance(value, dict):
-            return tuple(
-                (key, self._freeze_fingerprint_value(item))
-                for key, item in sorted(value.items(), key=lambda item: str(item[0]))
-            )
-        return value
+        return _freeze_fingerprint_value(value)
 
     def _field_fingerprint(self, field):
-        """Structural fingerprint of a field definition.
-
-        Covers every instance attribute (validators, error messages,
-        choices, input formats, coercion callables, subfields and so on) so
-        that configuration changes invalidate a cached round. Mutable
-        attributes are snapshotted; plain callables compare by identity.
-        Nested subfields (ComboField / MultiValueField) and the widget are
-        fingerprinted recursively.
-        """
-        items = []
-        for key, value in vars(field).items():
-            if (
-                key == "fields"
-                and isinstance(value, (list, tuple))
-                and value
-                and all(isinstance(sub, Field) for sub in value)
-            ):
-                value = tuple(self._field_fingerprint(sub) for sub in value)
-            elif key == "widget":
-                value = (
-                    type(value),
-                    self._freeze_fingerprint_value(vars(value)),
-                )
-            else:
-                value = self._freeze_fingerprint_value(value)
-            items.append((key, value))
-        return tuple(sorted(items, key=lambda item: item[0]))
+        return _field_fingerprint(field)
 
     def _fields_fingerprint(self, fields):
-        return tuple(
-            (name, self._field_fingerprint(field))
-            for name, field in fields.items()
-        )
+        return _fields_fingerprint(fields)
 
     def _current_validation_fingerprint(self):
         """Fingerprint of the live inputs and the live field definitions."""
