@@ -669,7 +669,11 @@ class BaseForm(RenderableFormMixin):
             # Atomically publish this round's staging as the form result.
             self._errors = state.errors
             self._cleaned_data = state.cleaned_data
-            self.changed_data = state.changed_data
+            # Cache the round's changed_data directly rather than through the
+            # property setter: a subclass overriding changed_data with a
+            # read-only property has no setter, but its implementation still
+            # reads the cached base value via super().changed_data.
+            self.__dict__["changed_data"] = state.changed_data
             self._validation_fingerprint = state.fingerprint
             self._async_validation = None
         # A detached (superseded) round keeps its conclusion only to serve
@@ -823,8 +827,11 @@ class BaseForm(RenderableFormMixin):
         self._async_validation = None
         # The bound inputs are about to define a new result, so a changed_data
         # list cached for earlier inputs must not survive the pass; the checks
-        # below repopulate it from the current data and initial.
-        del self.changed_data
+        # below repopulate it from the current data and initial. Drop the
+        # cache entry directly rather than going through the property: a
+        # subclass may override changed_data with a read-only property (e.g.
+        # AdminPasswordChangeForm), which has no deleter.
+        self.__dict__.pop("changed_data", None)
         self._errors = ErrorDict(renderer=self.renderer)
         if not self.is_bound:  # Stop further processing.
             self._record_validation_fingerprint()
@@ -936,7 +943,13 @@ class BaseForm(RenderableFormMixin):
         state.errors = ErrorDict(renderer=self.renderer)
         # Determine the changed fields from the round snapshot before any
         # early return so every published result carries a concrete list.
-        state.changed_data = self.changed_data
+        # Compute the base list directly rather than reading self.changed_data:
+        # a subclass may override changed_data to transform the base list (e.g.
+        # AdminPasswordChangeForm), and the published cache must hold the raw
+        # base value the override reads through super(), not its transform.
+        state.changed_data = [
+            name for name, bf in self._bound_items() if bf._has_changed()
+        ]
         if not state.is_bound:  # Stop further processing.
             return
         self.cleaned_data = {}

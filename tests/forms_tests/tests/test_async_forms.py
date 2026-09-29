@@ -287,6 +287,30 @@ class AsyncIsValidTests(SimpleTestCase):
         self.assertIs(await form.ais_valid(), True)
         self.assertEqual(dict(form.errors), {})
 
+    async def test_readonly_changed_data_property_override(self):
+        # AdminPasswordChangeForm overrides changed_data with a read-only
+        # property that reads the base cache via super(). The internal cache
+        # management in both the synchronous and asynchronous cleaning paths
+        # must not assign to or delete the property directly.
+        class PasswordLikeForm(Form):
+            password1 = CharField(required=False)
+            password2 = CharField(required=False)
+
+            @property
+            def changed_data(self):
+                data = super().changed_data
+                if "password1" in data and "password2" in data:
+                    return ["password"]
+                return []
+
+        data = {"password1": "secret", "password2": "secret"}
+        sync_form = PasswordLikeForm(data)
+        async_form = PasswordLikeForm(data)
+        self.assertIs(sync_form.is_valid(), True)
+        self.assertEqual(sync_form.changed_data, ["password"])
+        self.assertIs(await async_form.ais_valid(), True)
+        self.assertEqual(async_form.changed_data, ["password"])
+
 
 class EmptyPermittedForm(Form):
     first_name = CharField()
