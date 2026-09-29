@@ -65,7 +65,7 @@ class _AsyncFormSetValidationState:
     formset-wide cleaning each run only once per round.
     """
 
-    def __init__(self, *, epoch, is_bound, inputs, fingerprint):
+    def __init__(self, *, epoch, is_bound, inputs, config, fingerprint):
         self.runner_task = None
         # Number of ais_valid() callers currently awaiting the runner task.
         self.waiters = 0
@@ -96,6 +96,14 @@ class _AsyncFormSetValidationState:
         # later call can reuse the completed result or must supersede the
         # in-flight round.
         self.fingerprint = fingerprint
+        # Factory configuration frozen when the round started. The runner
+        # reads these via the round-aware configuration helpers instead of
+        # the live class/instance attributes, so toggling deletion, ordering,
+        # extra rows, the count limits or the validation switches while a
+        # round is in flight cannot change the participating rows, the
+        # deletion/ordering decisions, the count errors or the formset-wide
+        # cleaning of the waiting (old) round.
+        self.config = config
         # Child forms constructed from the snapshot; the runner validates
         # exactly these instances, in construction (declaration) order. They
         # stay private until the round publishes, when they replace the live
@@ -257,6 +265,21 @@ class BaseFormSet(RenderableFormMixin):
                 return state
         return None
 
+    def _cfg(self, name):
+        """Resolve a factory configuration value for the running task.
+
+        On an asynchronous validation round the value is read from the
+        configuration frozen when that round started; elsewhere it is read
+        from the live instance/class attribute. This keeps a waiting round
+        on its original configuration -- deletion and ordering switches,
+        extra rows, the number limits and the validation switches -- even
+        when the public attributes are reassigned while it is in flight.
+        """
+        state = self._current_async_state()
+        if state is not None:
+            return state.config[name]
+        return getattr(self, name)
+
     @property
     def data(self):
         # The task running an asynchronous round reads from its detached
@@ -382,17 +405,18 @@ class BaseFormSet(RenderableFormMixin):
             # from forcing the server to instantiate arbitrary numbers of
             # forms
             return min(
-                self.management_form.cleaned_data[TOTAL_FORM_COUNT], self.absolute_max
+                self.management_form.cleaned_data[TOTAL_FORM_COUNT],
+                self._cfg("absolute_max"),
             )
         else:
             initial_forms = self.initial_form_count()
-            total_forms = max(initial_forms, self.min_num) + self.extra
+            total_forms = max(initial_forms, self._cfg("min_num")) + self._cfg("extra")
             # Allow all existing related objects/inlines to be displayed,
             # but don't allow extra beyond max_num.
-            if initial_forms > self.max_num >= 0:
+            if initial_forms > self._cfg("max_num") >= 0:
                 total_forms = initial_forms
-            elif total_forms > self.max_num >= 0:
-                total_forms = self.max_num
+            elif total_forms > self._cfg("max_num") >= 0:
+                total_forms = self._cfg("max_num")
         return total_forms
 
     def initial_form_count(self):
@@ -435,10 +459,10 @@ class BaseFormSet(RenderableFormMixin):
                 pass
         # Allow extra forms to be empty, unless they're part of
         # the minimum forms.
-        if i >= self.initial_form_count() and i >= self.min_num:
+        if i >= self.initial_form_count() and i >= self._cfg("min_num"):
             defaults["empty_permitted"] = True
         defaults.update(kwargs)
-        form = self.form(**defaults)
+        form = self._cfg("form")(**defaults)
         self.add_fields(form, i)
         return form
 
@@ -513,7 +537,7 @@ class BaseFormSet(RenderableFormMixin):
         if state is not None:
             # Mirror the synchronous property exactly, including its
             # is_valid() / can_delete gates, evaluated on the round staging.
-            if not self.is_valid() or not self.can_delete:
+            if not self.is_valid() or not self._cfg("can_delete"):
                 return []
             if state.deleted_form_indexes is None:
                 state.deleted_form_indexes = self._compute_deleted_form_indexes(
@@ -542,7 +566,7 @@ class BaseFormSet(RenderableFormMixin):
             if i >= self.initial_form_count() and not form.has_changed():
                 continue
             # don't add data marked for deletion to self.ordered_data
-            if self.can_delete and self._should_delete_form(form):
+            if self._cfg("can_delete") and self._should_delete_form(form):
                 continue
             ordering.append((i, form.cleaned_data[ORDERING_FIELD_NAME]))
 
@@ -567,7 +591,7 @@ class BaseFormSet(RenderableFormMixin):
         if state is not None:
             # Mirror the synchronous property exactly, including its
             # is_valid() / can_order gates, evaluated on the round staging.
-            if not self.is_valid() or not self.can_order:
+            if not self.is_valid() or not self._cfg("can_order"):
                 raise AttributeError(
                     "'%s' object has no attribute 'ordered_forms'"
                     % self.__class__.__name__
@@ -784,13 +808,19 @@ class BaseFormSet(RenderableFormMixin):
         Concurrent calls on the same unchanged snapshot share a single
         cleaning round: each child form and the formset-wide cleaning run
         only once, and callers joining later cannot change the inputs or
-        outcome. If the bound data, initial data, form count or field
-        definitions change while a round is running, the next call starts a
-        fresh round solely against the new snapshot; the superseded round
-        keeps serving its own waiters from its snapshot but can never
-        publish over the newer result. If every waiting caller is cancelled,
-        the unfinished round is discarded (including its temporary errors)
-        and the next call performs a full retry.
+        outcome. A round pins everything it cleans against -- the bound
+        data, initial data, field definitions and the factory configuration
+        (the deletion and ordering switches, the extra rows, the number
+        limits and the validation switches) -- so reassignment of any of
+        those while the round is parked in an async validator cannot change
+        the waiting round's participating rows, deletion/ordering
+        decisions, count errors or formset-wide cleaning. The next call
+        detects the change and starts a fresh round solely against the new
+        snapshot; the superseded round keeps serving its own waiters from
+        its snapshot but can never publish over the newer result. If every
+        waiting caller is cancelled, the unfinished round is discarded
+        (including its temporary errors) and the next call performs a full
+        retry.
         """
         state = self._async_validation
         if state is None:
@@ -886,6 +916,29 @@ class BaseFormSet(RenderableFormMixin):
             getattr(self, "instance", None),
         )
 
+    def _configuration_snapshot(self):
+        """Immutable copy of the factory configuration for a new round.
+
+        The runner resolves these via ``_cfg()`` so changing the deletion
+        and ordering switches, the extra rows, the number limits or the
+        validation switches after the round starts cannot affect it. The
+        bound inputs, per-row ``form_kwargs`` and field definitions have
+        their own snapshots (see the round state).
+        """
+        return {
+            "prefix": self.prefix,
+            "form": self.form,
+            "extra": getattr(self, "extra", None),
+            "can_order": getattr(self, "can_order", False),
+            "can_delete": getattr(self, "can_delete", False),
+            "can_delete_extra": getattr(self, "can_delete_extra", True),
+            "min_num": getattr(self, "min_num", None),
+            "max_num": getattr(self, "max_num", None),
+            "absolute_max": getattr(self, "absolute_max", None),
+            "validate_min": getattr(self, "validate_min", False),
+            "validate_max": getattr(self, "validate_max", False),
+        }
+
     def _current_validation_fingerprint(self):
         """Fingerprint of the live inputs and the live configuration."""
         data, files, initial, initial_extra, _form_kwargs = (
@@ -927,6 +980,7 @@ class BaseFormSet(RenderableFormMixin):
         state = _AsyncFormSetValidationState(
             is_bound=self.is_bound,
             inputs=inputs,
+            config=self._configuration_snapshot(),
             fingerprint=self._build_snapshot_fingerprint(inputs),
             epoch=self._validation_epoch,
         )
@@ -975,7 +1029,7 @@ class BaseFormSet(RenderableFormMixin):
         management = ManagementForm(
             state.data,
             auto_id=self.auto_id,
-            prefix=self.prefix,
+            prefix=state.config["prefix"],
             renderer=self.renderer,
         )
         management.full_clean()
@@ -1050,30 +1104,33 @@ class BaseFormSet(RenderableFormMixin):
             self._async_raise_if_discarded(state)
             # _should_delete_form() requires cleaned_data. Forms due to be
             # deleted are not retained and can't make the formset invalid.
-            if self.can_delete and self._should_delete_form(form):
+            if self._cfg("can_delete") and self._should_delete_form(form):
                 continue
             state.errors.append(form.errors)
         try:
             if (
-                self.validate_max
-                and self.total_form_count() - len(self.deleted_forms) > self.max_num
+                self._cfg("validate_max")
+                and self.total_form_count() - len(self.deleted_forms)
+                > self._cfg("max_num")
             ) or (
                 state.management_form.cleaned_data[TOTAL_FORM_COUNT]
-                > self.absolute_max
+                > self._cfg("absolute_max")
             ):
                 raise ValidationError(
-                    self.error_messages["too_many_forms"] % {"num": self.max_num},
+                    self.error_messages["too_many_forms"]
+                    % {"num": self._cfg("max_num")},
                     code="too_many_forms",
                 )
             if (
-                self.validate_min
+                self._cfg("validate_min")
                 and self.total_form_count()
                 - len(self.deleted_forms)
                 - empty_forms_count
-                < self.min_num
+                < self._cfg("min_num")
             ):
                 raise ValidationError(
-                    self.error_messages["too_few_forms"] % {"num": self.min_num},
+                    self.error_messages["too_few_forms"]
+                    % {"num": self._cfg("min_num")},
                     code="too_few_forms",
                 )
             # Give self.clean() a chance to do cross-form validation.
@@ -1109,11 +1166,11 @@ class BaseFormSet(RenderableFormMixin):
                 if state.result:
                     # Build the derived caches from the round forms so the
                     # published result is immediately complete.
-                    if self.can_delete and state.deleted_form_indexes is None:
+                    if self._cfg("can_delete") and state.deleted_form_indexes is None:
                         state.deleted_form_indexes = (
                             self._compute_deleted_form_indexes(state.forms)
                         )
-                    if self.can_order and state.ordering is None:
+                    if self._cfg("can_order") and state.ordering is None:
                         state.ordering = self._compute_ordering(state.forms)
                 if state.deleted_form_indexes is not None:
                     self._deleted_form_indexes = state.deleted_form_indexes
@@ -1158,7 +1215,7 @@ class BaseFormSet(RenderableFormMixin):
     def add_fields(self, form, index):
         """A hook for adding extra fields on to each form instance."""
         initial_form_count = self.initial_form_count()
-        if self.can_order:
+        if self._cfg("can_order"):
             # Only pre-fill the ordering field for initial forms.
             if index is not None and index < initial_form_count:
                 form.fields[ORDERING_FIELD_NAME] = IntegerField(
@@ -1173,8 +1230,9 @@ class BaseFormSet(RenderableFormMixin):
                     required=False,
                     widget=self.get_ordering_widget(),
                 )
-        if self.can_delete and (
-            self.can_delete_extra or (index is not None and index < initial_form_count)
+        if self._cfg("can_delete") and (
+            self._cfg("can_delete_extra")
+            or (index is not None and index < initial_form_count)
         ):
             form.fields[DELETION_FIELD_NAME] = BooleanField(
                 label=_("Delete"),
@@ -1183,7 +1241,8 @@ class BaseFormSet(RenderableFormMixin):
             )
 
     def add_prefix(self, index):
-        return "%s-%s" % (self.prefix, index)
+        prefix = self._cfg("prefix")
+        return "%s-%s" % (prefix, index)
 
     def is_multipart(self):
         """

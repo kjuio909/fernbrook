@@ -939,6 +939,102 @@ class AsyncSupersededRoundTests(SimpleTestCase):
         self.assertEqual(formset.cleaned_data[0]["name"], "new")
 
 
+class AsyncFormSetConfigFreezeTests(SimpleTestCase):
+    """A waiting round keeps the configuration it started with.
+
+    The deletion/ordering switches, the extra rows, the number limits and the
+    validation switches may be reassigned while an asynchronous round is
+    parked in an async validator. The old round must finish on its frozen
+    configuration; only a later call adopts the new configuration.
+    """
+
+    @staticmethod
+    def _gated_formset(event, data, **factory_kwargs):
+        async def gated(value):
+            await event.wait()
+
+        class F(Form):
+            name = CharField(validators=[gated])
+
+        FormSet = formset_factory(F, **factory_kwargs)
+        return FormSet(data)
+
+    async def test_deletion_switch_change_keeps_old_round_on_snapshot(self):
+        event = asyncio.Event()
+        # INITIAL_FORMS=1 makes the row required; it is emptied and marked for
+        # deletion, which exempts it only while can_delete is in effect.
+        data = formset_data([{}], initial=1, delete=[0])
+        formset = self._gated_formset(event, data, can_delete=True, extra=0)
+        task = asyncio.create_task(formset.ais_valid())
+        await asyncio.sleep(0.05)
+        formset.can_delete = False
+        event.set()
+        # The waiting round froze can_delete=True, so the deleted row is
+        # exempt and its "required" error cannot make the round fail.
+        self.assertIs(await task, True)
+        # The deleted row is omitted from the retained errors entirely.
+        self.assertEqual(formset.errors, [])
+        # The published child forms were built with the deletion machinery.
+        self.assertIn("DELETE", formset.forms[0].fields)
+        # A later call starts a fresh round with can_delete=False.
+        self.assertIs(await formset.ais_valid(), False)
+        self.assertIn("name", formset.errors[0])
+
+    async def test_validate_max_switch_is_frozen(self):
+        event = asyncio.Event()
+        data = formset_data([{"name": "a"}, {"name": "b"}])
+        formset = self._gated_formset(
+            event, data, extra=0, max_num=1, validate_max=True, absolute_max=10
+        )
+        task = asyncio.create_task(formset.ais_valid())
+        await asyncio.sleep(0.05)
+        formset.validate_max = False
+        event.set()
+        # The old round froze validate_max=True: two forms exceed max_num=1.
+        self.assertIs(await task, False)
+        errors = formset.non_form_errors().as_data()
+        self.assertEqual(errors[0].code, "too_many_forms")
+        # Only the new configuration (validate_max=False) drops the error.
+        self.assertIs(await formset.ais_valid(), True)
+        self.assertEqual(list(formset.non_form_errors()), [])
+
+    async def test_max_num_change_is_frozen(self):
+        event = asyncio.Event()
+        data = formset_data([{"name": "a"}, {"name": "b"}])
+        formset = self._gated_formset(
+            event, data, extra=0, max_num=5, validate_max=True, absolute_max=10
+        )
+        task = asyncio.create_task(formset.ais_valid())
+        await asyncio.sleep(0.05)
+        formset.max_num = 1
+        event.set()
+        # The old round froze max_num=5, so two forms are within the limit.
+        self.assertIs(await task, True)
+        self.assertEqual(list(formset.non_form_errors()), [])
+        # The tightened limit only governs a fresh round.
+        self.assertIs(await formset.ais_valid(), False)
+        self.assertEqual(
+            formset.non_form_errors().as_data()[0].code, "too_many_forms"
+        )
+
+    async def test_ordering_switch_is_frozen(self):
+        event = asyncio.Event()
+        data = formset_data([{"name": "a"}, {"name": "b"}], order=["2", "1"])
+        formset = self._gated_formset(event, data, can_order=True, extra=0)
+        task = asyncio.create_task(formset.ais_valid())
+        await asyncio.sleep(0.05)
+        formset.can_order = False
+        event.set()
+        self.assertIs(await task, True)
+        # The frozen round built its child forms with the ordering field.
+        self.assertIn("ORDER", formset.forms[0].fields)
+        # A fresh round with can_order=False builds no ordering machinery.
+        self.assertIs(await formset.ais_valid(), True)
+        self.assertNotIn("ORDER", formset.forms[0].fields)
+        with self.assertRaises(AttributeError):
+            formset.ordered_forms
+
+
 # The Jinja2 renderer only affects rendering; run the same parity checks on it
 # to make sure the async path carries the renderer through.
 @jinja2_tests
