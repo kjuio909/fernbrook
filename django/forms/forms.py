@@ -669,7 +669,11 @@ class BaseForm(RenderableFormMixin):
             # Atomically publish this round's staging as the form result.
             self._errors = state.errors
             self._cleaned_data = state.cleaned_data
-            self.changed_data = state.changed_data
+            # Cache the base changed-fields list in the instance dict instead
+            # of assigning through the property: the attribute may be
+            # overridden with a read-only property by a subclass, whose
+            # getter reads the base list back via super().changed_data.
+            self.__dict__["changed_data"] = state.changed_data
             self._validation_fingerprint = state.fingerprint
             self._async_validation = None
         # A detached (superseded) round keeps its conclusion only to serve
@@ -823,8 +827,12 @@ class BaseForm(RenderableFormMixin):
         self._async_validation = None
         # The bound inputs are about to define a new result, so a changed_data
         # list cached for earlier inputs must not survive the pass; the checks
-        # below repopulate it from the current data and initial.
-        del self.changed_data
+        # below repopulate it from the current data and initial. Drop the
+        # instance-dict cache directly: like the former cached_property, the
+        # attribute may be overridden with a read-only property by a subclass
+        # (e.g. AdminPasswordChangeForm), in which case ``del`` has no deleter
+        # to invoke.
+        self.__dict__.pop("changed_data", None)
         self._errors = ErrorDict(renderer=self.renderer)
         if not self.is_bound:  # Stop further processing.
             self._record_validation_fingerprint()
@@ -936,7 +944,11 @@ class BaseForm(RenderableFormMixin):
         state.errors = ErrorDict(renderer=self.renderer)
         # Determine the changed fields from the round snapshot before any
         # early return so every published result carries a concrete list.
-        state.changed_data = self.changed_data
+        # Compute the base list directly rather than through self.changed_data:
+        # a subclass may override the property and map the base list (e.g.
+        # AdminPasswordChangeForm), and only the base list is cached and later
+        # handed to the override via super().changed_data.
+        state.changed_data = self._compute_changed_data()
         if not state.is_bound:  # Stop further processing.
             return
         self.cleaned_data = {}
@@ -976,6 +988,18 @@ class BaseForm(RenderableFormMixin):
         """Return True if data differs from initial."""
         return bool(self.changed_data)
 
+    def _compute_changed_data(self):
+        """The base changed-fields list for the active inputs.
+
+        Computed directly from the bound fields -- on the runner task the
+        data/files/fields properties already resolve to the round snapshot
+        -- and bypasses a subclass override of ``changed_data``. The round
+        and the instance cache hold this base list; an override (such as
+        AdminPasswordChangeForm's) maps it when it calls
+        ``super().changed_data``.
+        """
+        return [name for name, bf in self._bound_items() if bf._has_changed()]
+
     @property
     def changed_data(self):
         state = self._current_async_state()
@@ -986,14 +1010,12 @@ class BaseForm(RenderableFormMixin):
             # shared cache is never populated, so it stays tied to the live
             # inputs.
             if state.changed_data is None:
-                state.changed_data = [
-                    name for name, bf in self._bound_items() if bf._has_changed()
-                ]
+                state.changed_data = self._compute_changed_data()
             return state.changed_data
         try:
             return self.__dict__["changed_data"]
         except KeyError:
-            value = [name for name, bf in self._bound_items() if bf._has_changed()]
+            value = self._compute_changed_data()
             self.__dict__["changed_data"] = value
             return value
 

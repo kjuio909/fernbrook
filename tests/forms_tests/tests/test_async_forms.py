@@ -1186,3 +1186,60 @@ class AsyncSyncInterleaveTests(SimpleTestCase):
         self.assertIs(await form.ais_valid(), True)
         self.assertEqual(form.cleaned_data, {"name": "old"})
 
+
+class ChangedDataOverrideTests(SimpleTestCase):
+    """A read-only property override of changed_data must keep working.
+
+    AdminPasswordChangeForm overrides changed_data with a plain ``@property``
+    that reads the base list via ``super()``; the asynchronous validation
+    machinery must not require a setter or deleter on the override.
+    """
+
+    def _form_class(self):
+        class PasswordForm(Form):
+            password1 = CharField(required=False)
+            password2 = CharField(required=False)
+
+            @property
+            def changed_data(self):
+                data = super().changed_data
+                if "password1" in data and "password2" in data:
+                    return ["password"]
+                return []
+
+        return PasswordForm
+
+    def test_sync_validation_with_read_only_override(self):
+        form = self._form_class()(
+            {"password1": "new-secret", "password2": "new-secret"}
+        )
+        # full_clean() must be able to reset the changed_data cache even
+        # though the override exposes no deleter.
+        self.assertIs(form.is_valid(), True)
+        self.assertEqual(form.changed_data, ["password"])
+
+        unchanged = self._form_class()({"password1": "", "password2": ""})
+        self.assertIs(unchanged.is_valid(), True)
+        self.assertEqual(unchanged.changed_data, [])
+
+    async def test_async_validation_with_read_only_override(self):
+        sync_form = self._form_class()(
+            {"password1": "new-secret", "password2": "new-secret"}
+        )
+        async_form = self._form_class()(
+            {"password1": "new-secret", "password2": "new-secret"}
+        )
+        self.assertIs(sync_form.is_valid(), True)
+        self.assertIs(await async_form.ais_valid(), True)
+        self.assertEqual(async_form.changed_data, ["password"])
+        self.assertEqual(async_form.changed_data, sync_form.changed_data)
+
+    async def test_async_override_recomputes_per_snapshot(self):
+        form = self._form_class()(
+            {"password1": "new-secret", "password2": "new-secret"}
+        )
+        self.assertIs(await form.ais_valid(), True)
+        self.assertEqual(form.changed_data, ["password"])
+        form.data = {"password1": "", "password2": ""}
+        self.assertIs(await form.ais_valid(), True)
+        self.assertEqual(form.changed_data, [])
